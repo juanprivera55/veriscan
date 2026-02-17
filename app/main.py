@@ -18,8 +18,8 @@ from PIL import Image, ImageDraw, ImageFont
 import imagehash
 import piexif
 
+# DB
 import sqlite3
-
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -28,8 +28,8 @@ except Exception:
     RealDictCursor = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
+BASE_DIR = Path(__file__).resolve().parent          # .../veriscan/app
+STATIC_DIR = BASE_DIR / "static"                    # .../veriscan/app/static
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
@@ -37,6 +37,7 @@ app = FastAPI(title="VeriScan V1 Demo (Hosted)")
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
+# Caches
 DOMAIN_AGE_CACHE: dict[str, dict] = {}
 CORRO_CACHE: dict[str, dict] = {}
 
@@ -166,7 +167,12 @@ def db_get_scan(scan_id: str) -> dict | None:
                 if not row:
                     return None
                 report = json.loads(row["report_json"]) if row.get("report_json") else None
-                return {"scan_id": row["scan_id"], "status": row["status"], "report": report, "error": row.get("error_text")}
+                return {
+                    "scan_id": row["scan_id"],
+                    "status": row["status"],
+                    "report": report,
+                    "error": row.get("error_text"),
+                }
         finally:
             conn.close()
     else:
@@ -177,7 +183,12 @@ def db_get_scan(scan_id: str) -> dict | None:
             if not row:
                 return None
             report = json.loads(row["report_json"]) if row["report_json"] else None
-            return {"scan_id": row["scan_id"], "status": row["status"], "report": report, "error": row["error_text"]}
+            return {
+                "scan_id": row["scan_id"],
+                "status": row["status"],
+                "report": report,
+                "error": row["error_text"],
+            }
         finally:
             conn.close()
 
@@ -186,6 +197,10 @@ def db_get_scan(scan_id: str) -> dict | None:
 def _startup():
     db_init()
 
+
+# -------------------------
+# Helpers
+# -------------------------
 
 def is_url_safe(url: str) -> bool:
     p = urlparse(url)
@@ -456,8 +471,16 @@ def score_link(signals: dict) -> dict:
         "band_label": band_label(overall),
         "badges": badges,
         "summary_text": summary,
-        "pillars": {"source": source, "cross_verify": cross_verify, "ai_manip": ai_manip, "context": context},
-        "evidence": {"signals": signals, "unavailable_signals": unavailable},
+        "pillars": {
+            "source": source,
+            "cross_verify": cross_verify,
+            "ai_manip": ai_manip,
+            "context": context,
+        },
+        "evidence": {
+            "signals": signals,
+            "unavailable_signals": unavailable,
+        },
     }
 
 
@@ -514,21 +537,24 @@ def score_image(signals: dict) -> dict:
         "band_label": band_label(overall),
         "badges": [],
         "summary_text": summary,
-        "pillars": {"source": source, "cross_verify": cross_verify, "ai_manip": ai_manip, "context": context},
-        "evidence": {"signals": signals, "unavailable_signals": unavailable},
+        "pillars": {
+            "source": source,
+            "cross_verify": cross_verify,
+            "ai_manip": ai_manip,
+            "context": context,
+        },
+        "evidence": {
+            "signals": signals,
+            "unavailable_signals": unavailable,
+        },
     }
 
 
 # -------------------------
-# NEW: Explain this score (plain English)
+# Explain this score
 # -------------------------
 
 def build_explanation(report: dict) -> dict:
-    """
-    Turns report pillars + evidence into human-readable explanations.
-    Output format:
-      { highlights: [...], concerns: [...], missing: [...], guidance: "..." }
-    """
     pillars = report.get("pillars") or {}
     evidence = report.get("evidence") or {}
     signals = evidence.get("signals") or {}
@@ -547,45 +573,46 @@ def build_explanation(report: dict) -> dict:
     if isinstance(hits, int):
         if hits >= 3:
             highlights.append(f"Multiple trusted sources appear to cover similar facts ({hits} matched trusted domain(s)).")
-        elif hits == 1 or hits == 2:
+        elif hits in (1, 2):
             highlights.append(f"Some trusted corroboration exists ({hits} matched trusted domain(s)).")
-        elif hits == 0:
+        elif hits == 0 and is_link:
             concerns.append("No matches were found on the trusted corroboration list (not proof of falsehood, but less support).")
     else:
-        missing_items.append("Trusted corroboration check was unavailable for this scan.")
+        if is_link:
+            missing_items.append("Trusted corroboration check was unavailable for this scan.")
 
     # Domain age
     age_days = signals.get("domain_age_days")
-    if age_days is None:
+    if age_days is None and is_link:
         missing_items.append("Domain age could not be determined.")
-    else:
-        if age_days >= 3650:  # ~10 years
+    elif isinstance(age_days, int):
+        if age_days >= 3650:
             highlights.append("The domain is long-established (older domains are harder to spoof at scale).")
         elif age_days < 180:
             concerns.append("The domain is relatively new (new domains are more commonly used for spam/misinformation).")
 
     # HTTPS
     https = signals.get("https")
-    if https is True:
+    if https is True and is_link:
         highlights.append("The link uses HTTPS (basic transport security).")
     elif https is False and is_link:
         concerns.append("The link is not using HTTPS (higher risk).")
 
     # Blocked
-    if signals.get("blocked") is True:
+    if signals.get("blocked") is True and is_link:
         concerns.append("The site blocked automated access; analysis relied more on domain-level signals.")
     elif is_link and signals.get("title"):
         highlights.append("Page title/content signals were available for analysis.")
 
-    # Outbound links / citations proxy
+    # Outbound links (citation proxy)
     out = signals.get("outbound_links_count")
-    if isinstance(out, int):
+    if isinstance(out, int) and is_link and signals.get("blocked") is False:
         if out >= 15:
             highlights.append("The page links out to multiple references (a weak proxy for citations).")
-        elif out <= 1 and is_link and signals.get("blocked") is False:
+        elif out <= 1:
             concerns.append("Few or no outbound links were detected (less transparent sourcing).")
 
-    # Image EXIF
+    # Image-specific
     if is_image:
         exif_present = signals.get("exif_present")
         if exif_present is True:
@@ -596,7 +623,7 @@ def build_explanation(report: dict) -> dict:
         if signals.get("exif_software"):
             concerns.append("Editing software is listed in metadata (could be normal, but can indicate manipulation).")
 
-    # Missing list (normalize)
+    # Normalize missing list
     for m in missing:
         if m == "AI_MANIPULATION":
             missing_items.append("AI/manipulation classification is not enabled in this demo.")
@@ -609,7 +636,6 @@ def build_explanation(report: dict) -> dict:
         else:
             missing_items.append(m.replace("_", " ").title())
 
-    # Deduplicate while preserving order
     def uniq(xs):
         seen = set()
         out = []
@@ -628,7 +654,12 @@ def build_explanation(report: dict) -> dict:
         "If the claim is important, open 2–3 trusted outlets directly and compare details."
     )
 
-    return {"highlights": highlights, "concerns": concerns, "missing": missing_items, "guidance": guidance}
+    return {
+        "highlights": highlights,
+        "concerns": concerns,
+        "missing": missing_items,
+        "guidance": guidance,
+    }
 
 
 async def run_link_scan(scan_id: str, url: str):
@@ -703,15 +734,38 @@ async def create_image_scan(image: UploadFile = File(...)):
 
 @app.get("/api/v1/scan/{scan_id}")
 def get_scan(scan_id: str):
+    """
+    ✅ PATCH INCLUDED:
+    If report.explain is missing, compute it on read and persist it.
+    """
     item = db_get_scan(scan_id)
     if not item:
         raise HTTPException(status_code=404, detail="Not found")
+
     resp = {"scan_id": scan_id, "status": item["status"]}
+
     if item["status"] == "complete":
-        resp["report"] = item["report"]
+        report = item.get("report") or {}
+
+        # ---- PATCH: compute explain if missing ----
+        if "explain" not in report or not report.get("explain"):
+            try:
+                report["explain"] = build_explanation(report)
+                db_upsert_scan(scan_id, "complete", report=report)
+            except Exception:
+                pass
+        # -----------------------------------------
+
+        resp["report"] = report
+
     if item.get("error"):
         resp["error"] = item["error"]
+
     return resp
+
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _load_font(size: int) -> ImageFont.ImageFont:
@@ -762,14 +816,17 @@ def og_image(scan_id: str):
     panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
     img.paste(panel, (card_x, card_y), panel)
 
-    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
-                        radius=26, outline=(255, 255, 255, 45), width=2)
+    d.rounded_rectangle(
+        [card_x, card_y, card_x + card_w, card_y + card_h],
+        radius=26,
+        outline=(255, 255, 255, 45),
+        width=2
+    )
 
     logo_size = 70
     lx, ly = card_x + 38, card_y + 34
     d.rounded_rectangle([lx, ly, lx + logo_size, ly + logo_size], radius=22, fill=(120, 150, 255, 255))
-    d.rounded_rectangle([lx + 12, ly + 12, lx + logo_size - 12, ly + logo_size - 12],
-                        radius=18, fill=(255, 110, 110, 235))
+    d.rounded_rectangle([lx + 12, ly + 12, lx + logo_size - 12, ly + logo_size - 12], radius=18, fill=(255, 110, 110, 235))
 
     f_brand = _load_font(36)
     f_tag = _load_font(22)
@@ -818,13 +875,11 @@ def og_image(scan_id: str):
         chip_x = content_x + 170
         chip_y = content_y + 66
         chip_w, chip_h = 260, 54
-        d.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=26,
-                            fill=(col[0], col[1], col[2], 60),
+        d.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=26, fill=(col[0], col[1], col[2], 60),
                             outline=(col[0], col[1], col[2], 180), width=2)
         d.text((chip_x + 18, chip_y + 12), b, font=f_band, fill=(234, 240, 255, 255))
 
-        d.line([content_x, content_y + 150, card_x + card_w - 38, content_y + 150],
-               fill=(255, 255, 255, 35), width=2)
+        d.line([content_x, content_y + 150, card_x + card_w - 38, content_y + 150], fill=(255, 255, 255, 35), width=2)
 
         summ = _truncate(summary or "Probabilistic analysis based on available signals.", 160)
         d.text((content_x, content_y + 175), summ, font=f_body, fill=(234, 240, 255, 255))
@@ -833,8 +888,7 @@ def og_image(scan_id: str):
         if dom:
             d.text((content_x, content_y + 235), f"Domain: {dom}", font=f_small, fill=(168, 179, 214, 255))
 
-    d.text((content_x, card_y + card_h - 48), f"veriscan • report id {scan_id[:8]}",
-           font=f_small, fill=(168, 179, 214, 255))
+    d.text((content_x, card_y + card_h - 48), f"veriscan • report id {scan_id[:8]}", font=f_small, fill=(168, 179, 214, 255))
 
     out = io.BytesIO()
     img.convert("RGB").save(out, format="PNG", optimize=True)
