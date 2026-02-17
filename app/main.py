@@ -34,6 +34,13 @@ INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
 
+APP_VERSION = "explain-v1-2026-02-17"
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
+
+
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
