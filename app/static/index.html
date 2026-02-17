@@ -2,74 +2,594 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>VeriScan Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>VeriScan</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 40px; max-width: 820px; }
-    input { width: 100%; padding: 12px; font-size: 16px; }
-    button { padding: 12px 16px; font-size: 16px; margin-top: 10px; cursor: pointer; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-top: 18px; }
-    .muted { color: #666; }
-    details { margin-top: 10px; }
-    pre { background: #f7f7f7; padding: 12px; border-radius: 10px; overflow: auto; }
-    hr { margin: 24px 0; }
-    a { color: #0b57d0; }
+    :root{
+      --bg:#0b1020;
+      --panel:#0f1733;
+      --card:#111c3d;
+      --muted:#a8b3d6;
+      --text:#eaf0ff;
+      --line:rgba(255,255,255,.10);
+      --shadow: 0 12px 30px rgba(0,0,0,.35);
+      --radius:16px;
+      --radius2:22px;
+      --pad:18px;
+    }
+    *{ box-sizing:border-box; }
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      color:var(--text);
+      background: radial-gradient(1200px 900px at 10% 0%, rgba(90,120,255,.22), transparent 60%),
+                  radial-gradient(900px 700px at 95% 10%, rgba(255,110,110,.14), transparent 55%),
+                  var(--bg);
+    }
+    a{ color:#cfe0ff; text-decoration:none; }
+    a:hover{ text-decoration:underline; }
+
+    .wrap{ max-width:980px; margin:0 auto; padding:28px 16px 60px; }
+    .topbar{
+      display:flex; gap:12px; align-items:center; justify-content:space-between;
+      margin-bottom:18px;
+    }
+    .brand{
+      display:flex; align-items:center; gap:10px;
+    }
+    .logo{
+      width:40px; height:40px; border-radius:14px;
+      background: linear-gradient(135deg, rgba(120,150,255,.95), rgba(255,110,110,.75));
+      box-shadow: 0 10px 26px rgba(0,0,0,.35);
+    }
+    .brand h1{ font-size:18px; margin:0; letter-spacing:.2px; }
+    .brand .tag{ font-size:12px; color:var(--muted); margin-top:2px; }
+
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 12px;
+      border:1px solid var(--line);
+      border-radius:999px;
+      background: rgba(255,255,255,.06);
+      color: var(--muted);
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .pill strong{ color:var(--text); font-weight:700; }
+
+    .grid{
+      display:grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap:16px;
+      align-items:start;
+    }
+    @media (max-width: 900px){
+      .grid{ grid-template-columns: 1fr; }
+    }
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.03));
+      border:1px solid var(--line);
+      border-radius: var(--radius2);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .card .hd{
+      padding:16px 18px;
+      border-bottom:1px solid var(--line);
+      background: rgba(255,255,255,.03);
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+    }
+    .card .hd h2{
+      margin:0;
+      font-size:14px;
+      letter-spacing:.25px;
+      color:#d9e4ff;
+      font-weight:750;
+    }
+    .card .bd{ padding:18px; }
+
+    .muted{ color:var(--muted); }
+    .tiny{ font-size:12px; }
+
+    .field{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      margin-bottom:14px;
+    }
+    label{
+      font-size:12px;
+      color:var(--muted);
+      letter-spacing:.2px;
+    }
+    input[type="text"]{
+      width:100%;
+      padding:12px 12px;
+      border-radius: 14px;
+      border:1px solid var(--line);
+      background: rgba(0,0,0,.22);
+      color: var(--text);
+      outline:none;
+      font-size:14px;
+    }
+    input[type="file"]{
+      width:100%;
+      padding:10px 10px;
+      border-radius: 14px;
+      border:1px solid var(--line);
+      background: rgba(0,0,0,.22);
+      color: var(--muted);
+      outline:none;
+      font-size:13px;
+    }
+
+    .row{ display:flex; gap:10px; flex-wrap:wrap; }
+    .btn{
+      display:inline-flex; align-items:center; justify-content:center; gap:8px;
+      padding:11px 14px;
+      border-radius: 14px;
+      border:1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+      color: var(--text);
+      cursor:pointer;
+      font-weight:650;
+      font-size:13px;
+      transition: transform .06s ease, background .2s ease, border-color .2s ease;
+      user-select:none;
+    }
+    .btn:hover{ background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.22); }
+    .btn:active{ transform: translateY(1px); }
+    .btn.primary{
+      background: linear-gradient(135deg, rgba(120,150,255,.95), rgba(120,150,255,.65));
+      border-color: rgba(120,150,255,.65);
+    }
+    .btn.primary:hover{
+      background: linear-gradient(135deg, rgba(120,150,255,.98), rgba(120,150,255,.72));
+    }
+    .btn.danger{
+      background: rgba(255,110,110,.14);
+      border-color: rgba(255,110,110,.35);
+    }
+
+    .examples .btn{
+      padding:9px 11px; font-size:12px; border-radius: 12px;
+      background: rgba(255,255,255,.06);
+    }
+
+    .statusBox{
+      display:none;
+      margin-top:14px;
+      padding:14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,.20);
+    }
+    .statusLine{
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      margin-bottom:8px;
+    }
+    .spinner{
+      width:16px; height:16px; border-radius:50%;
+      border:2px solid rgba(255,255,255,.18);
+      border-top-color: rgba(255,255,255,.9);
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin{ to { transform: rotate(360deg);} }
+
+    .shareBox{
+      display:none;
+      margin-top:12px;
+      padding:12px 14px;
+      border-radius: var(--radius);
+      border:1px solid rgba(120,150,255,.35);
+      background: rgba(120,150,255,.10);
+    }
+    .shareRow{ display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+    .shareRow a{ word-break:break-all; }
+
+    .resultBox{ display:none; }
+
+    /* Score Header */
+    .scoreTop{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:16px;
+      flex-wrap:wrap;
+      margin-bottom:12px;
+    }
+    .scoreTitle{
+      display:flex; flex-direction:column; gap:6px;
+    }
+    .scoreTitle h3{
+      margin:0;
+      font-size:18px;
+      letter-spacing:.2px;
+      font-weight:800;
+    }
+    .chip{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:7px 10px;
+      border-radius: 999px;
+      font-size:12px;
+      font-weight:800;
+      border:1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      width: fit-content;
+    }
+    .chip strong{ font-weight:900; }
+    .chip.strong{ border-color: rgba(60,220,150,.55); background: rgba(60,220,150,.12); }
+    .chip.moderate{ border-color: rgba(255,210,90,.55); background: rgba(255,210,90,.12); }
+    .chip.limited{ border-color: rgba(255,150,70,.55); background: rgba(255,150,70,.12); }
+    .chip.weak{ border-color: rgba(255,110,110,.60); background: rgba(255,110,110,.12); }
+    .chip.uncertain{ border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.06); }
+
+    .meter{
+      width:320px;
+      max-width: 100%;
+    }
+    .meterTop{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    .meterTop .num{ font-size:28px; font-weight:900; letter-spacing:.3px; }
+    .meterTop .lab{ font-size:12px; color:var(--muted); }
+    .bar{
+      height:12px;
+      border-radius:999px;
+      background: rgba(255,255,255,.10);
+      border:1px solid var(--line);
+      overflow:hidden;
+    }
+    .bar > div{
+      height:100%;
+      width:0%;
+      background: linear-gradient(90deg, rgba(255,110,110,.95), rgba(255,210,90,.95), rgba(60,220,150,.95));
+    }
+
+    .badges{ display:flex; gap:8px; flex-wrap:wrap; margin: 10px 0 6px; }
+    .badge{
+      display:inline-flex; align-items:center; gap:6px;
+      padding:6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      font-size:12px;
+      color: #dfe8ff;
+      font-weight:700;
+    }
+    .badge.good{ border-color: rgba(60,220,150,.50); background: rgba(60,220,150,.12); }
+    .badge.warn{ border-color: rgba(255,210,90,.50); background: rgba(255,210,90,.12); }
+    .badge.bad{ border-color: rgba(255,110,110,.55); background: rgba(255,110,110,.12); }
+    .badge.neutral{ border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.06); color: var(--muted); }
+
+    .miniGrid{
+      display:grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap:10px;
+      margin-top:12px;
+    }
+    @media (max-width: 520px){
+      .miniGrid{ grid-template-columns: 1fr; }
+    }
+    .mini{
+      padding:12px;
+      border-radius: var(--radius);
+      border:1px solid var(--line);
+      background: rgba(0,0,0,.18);
+    }
+    .mini .k{ font-size:12px; color: var(--muted); margin-bottom:6px; }
+    .mini .v{ font-size:16px; font-weight:850; }
+
+    details{
+      margin-top:14px;
+      border-top:1px solid var(--line);
+      padding-top:12px;
+    }
+    summary{
+      cursor:pointer;
+      color:#dbe7ff;
+      font-weight:800;
+      font-size:13px;
+    }
+    pre{
+      margin-top:10px;
+      padding:12px;
+      border-radius:14px;
+      background: rgba(0,0,0,.26);
+      border: 1px solid var(--line);
+      overflow:auto;
+      color: #dfe8ff;
+      font-size:12px;
+      line-height:1.4;
+    }
+
+    .footerNote{
+      margin-top:12px;
+      color: var(--muted);
+      font-size:12px;
+      line-height:1.45;
+    }
   </style>
 </head>
+
 <body>
-  <h1>VeriScan (Shareable Results)</h1>
-  <p class="muted">Scan. Analyze. Decide. — Clarity in a world of noise.</p>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>VeriScan</h1>
+          <div class="tag">Scan. Analyze. Decide. — Clarity in a world of noise.</div>
+        </div>
+      </div>
+      <div class="pill"><strong>Demo</strong> • results are probabilistic</div>
+    </div>
 
-  <h3>Scan Link</h3>
-  <input id="url" placeholder="Paste an article URL (https://...)" />
-  <button onclick="startScan()">Scan Link</button>
+    <div class="grid">
+      <!-- LEFT: Inputs -->
+      <div class="card">
+        <div class="hd">
+          <h2>Run a Scan</h2>
+          <div class="pill tiny">Tip: start with a specific article (not a homepage)</div>
+        </div>
+        <div class="bd">
+          <div class="field">
+            <label>Scan Link</label>
+            <input id="url" type="text" placeholder="Paste an article URL (https://...)" />
+            <div class="row">
+              <button class="btn primary" onclick="startScan()">Scan Link</button>
+              <button class="btn" onclick="fillExample('ap')">Try AP News</button>
+              <button class="btn" onclick="fillExample('bbc')">Try BBC</button>
+              <button class="btn" onclick="fillExample('wiki')">Try Wikipedia</button>
+            </div>
+          </div>
 
-  <hr />
+          <div class="field">
+            <label>Scan Image</label>
+            <input id="img" type="file" accept="image/*" />
+            <div class="row">
+              <button class="btn primary" onclick="startImageScan()">Scan Image</button>
+              <button class="btn danger" onclick="resetAll()">Reset</button>
+            </div>
+          </div>
 
-  <h3>Scan Image</h3>
-  <input id="img" type="file" accept="image/*" />
-  <button onclick="startImageScan()">Scan Image</button>
+          <div id="status" class="statusBox">
+            <div class="statusLine">
+              <div id="statusText"><b>Status:</b> —</div>
+              <div id="spin" class="spinner" style="display:none;"></div>
+            </div>
+            <div id="statusSub" class="muted tiny"></div>
+          </div>
 
-  <div id="status" class="card" style="display:none;"></div>
-  <div id="share" class="card" style="display:none;"></div>
-  <div id="result" class="card" style="display:none;"></div>
+          <div id="share" class="shareBox">
+            <div class="shareRow">
+              <div>
+                <div class="tiny muted"><b>Shareable report</b></div>
+                <div><a id="shareLink" href="#" target="_blank">—</a></div>
+              </div>
+              <div class="row">
+                <button class="btn" onclick="copyShare()">Copy</button>
+                <button class="btn" onclick="openShare()">Open</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="footerNote">
+            Some sites block automated access. When that happens, VeriScan still analyzes domain signals but may not fetch full article text.
+            On free hosting, first scan can take a moment to wake the service.
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Results -->
+      <div class="card">
+        <div class="hd">
+          <h2>Result</h2>
+          <div class="pill tiny" id="resultHint">Run a scan to see the report</div>
+        </div>
+        <div class="bd">
+          <div id="result" class="resultBox"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 
 <script>
 let scanId = null;
 let shareUrl = null;
 let timer = null;
 
-function showStatus(html) {
-  const s = document.getElementById('status');
-  s.style.display = 'block';
-  s.innerHTML = html;
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function setStatus(show, text, sub, spinning){
+  const box = document.getElementById('status');
+  const spin = document.getElementById('spin');
+  const main = document.getElementById('statusText');
+  const subEl = document.getElementById('statusSub');
+
+  box.style.display = show ? 'block' : 'none';
+  main.innerHTML = text || '';
+  subEl.innerHTML = sub || '';
+  spin.style.display = spinning ? 'block' : 'none';
 }
 
 function showShare(url) {
-  const el = document.getElementById('share');
-  el.style.display = 'block';
+  const box = document.getElementById('share');
+  const a = document.getElementById('shareLink');
+  box.style.display = 'block';
+
   const full = `${location.origin}${url}`;
-  el.innerHTML = `<b>Share this result:</b> <a href="${url}" target="_blank">${full}</a>`;
+  a.href = url;
+  a.textContent = full;
+
+  shareUrl = url;
 }
 
-function hideShare() {
-  const el = document.getElementById('share');
-  el.style.display = 'none';
-  el.innerHTML = '';
+function hideShare(){
+  const box = document.getElementById('share');
+  const a = document.getElementById('shareLink');
+  box.style.display = 'none';
+  a.href = '#';
+  a.textContent = '—';
+  shareUrl = null;
 }
 
-function showResult(html) {
-  const r = document.getElementById('result');
-  r.style.display = 'block';
-  r.innerHTML = html;
+function showResult(html){
+  const el = document.getElementById('result');
+  el.style.display = 'block';
+  el.innerHTML = html;
+  document.getElementById('resultHint').textContent = 'Report ready';
+}
+
+function clearResult(){
+  document.getElementById('result').style.display = 'none';
+  document.getElementById('result').innerHTML = '';
+  document.getElementById('resultHint').textContent = 'Run a scan to see the report';
+}
+
+function resetAll(){
+  if (timer) clearInterval(timer);
+  scanId = null;
+  hideShare();
+  clearResult();
+  setStatus(false, '', '', false);
+  document.getElementById('url').value = '';
+  document.getElementById('img').value = '';
+}
+
+function fillExample(which){
+  const url = document.getElementById('url');
+  if (which === 'ap') url.value = 'https://apnews.com/';
+  if (which === 'bbc') url.value = 'https://www.bbc.com/';
+  if (which === 'wiki') url.value = 'https://en.wikipedia.org/wiki/Main_Page';
+}
+
+function bandClass(label){
+  const l = (label || '').toLowerCase();
+  if (l.includes('strong')) return 'strong';
+  if (l.includes('moderate')) return 'moderate';
+  if (l.includes('limited')) return 'limited';
+  if (l.includes('weak')) return 'weak';
+  return 'uncertain';
+}
+
+function badgeStyle(name){
+  const n = (name || '').toUpperCase();
+  if (n.includes('MULTI_SOURCE')) return 'good';
+  if (n.includes('NO_TRUSTED')) return 'warn';
+  if (n.includes('BLOCKED')) return 'bad';
+  return 'neutral';
+}
+
+function renderReport(r){
+  const score = r.overall_score ?? 0;
+  const label = r.band_label ?? 'Uncertain';
+  const cls = bandClass(label);
+
+  const badges = (r.badges && r.badges.length)
+    ? `<div class="badges">${r.badges.map(b => `<span class="badge ${badgeStyle(b)}">${escapeHtml(b)}</span>`).join('')}</div>`
+    : `<div class="badges"><span class="badge neutral">No badges</span></div>`;
+
+  const signals = (r.evidence && r.evidence.signals) ? r.evidence.signals : {};
+  const corroHits = signals.corroboration_hits;
+  const corroDomains = signals.corroboration_domains || [];
+  const domainAge = signals.domain_age_days;
+
+  const corroText = (typeof corroHits === 'number')
+    ? `${corroHits} trusted domain(s) ${corroDomains.length ? `(${corroDomains.slice(0,4).join(', ')}${corroDomains.length>4?'…':''})` : ''}`
+    : 'Unavailable';
+
+  const ageText = (typeof domainAge === 'number')
+    ? `${domainAge.toLocaleString()} days`
+    : 'Unknown';
+
+  const src = r.pillars?.source ?? 50;
+  const cross = r.pillars?.cross_verify ?? 50;
+  const ai = r.pillars?.ai_manip ?? 50;
+  const ctx = r.pillars?.context ?? 50;
+
+  showResult(`
+    <div class="scoreTop">
+      <div class="scoreTitle">
+        <h3>Confidence Score</h3>
+        <div class="chip ${cls}"><strong>${score}</strong> • ${escapeHtml(label)}</div>
+        <div class="muted tiny">${escapeHtml(r.summary_text || '')}</div>
+        ${badges}
+      </div>
+
+      <div class="meter">
+        <div class="meterTop">
+          <div class="num">${score}</div>
+          <div class="lab">0 = uncertain • 100 = strong</div>
+        </div>
+        <div class="bar"><div style="width:${Math.max(0, Math.min(100, score))}%;"></div></div>
+      </div>
+    </div>
+
+    <div class="miniGrid">
+      <div class="mini">
+        <div class="k">Trusted corroboration</div>
+        <div class="v">${escapeHtml(corroText)}</div>
+      </div>
+      <div class="mini">
+        <div class="k">Domain age</div>
+        <div class="v">${escapeHtml(ageText)}</div>
+      </div>
+      <div class="mini">
+        <div class="k">Source reliability</div>
+        <div class="v">${src}</div>
+      </div>
+      <div class="mini">
+        <div class="k">Cross-verification</div>
+        <div class="v">${cross}</div>
+      </div>
+      <div class="mini">
+        <div class="k">AI / manipulation</div>
+        <div class="v">${ai}</div>
+      </div>
+      <div class="mini">
+        <div class="k">Context integrity</div>
+        <div class="v">${ctx}</div>
+      </div>
+    </div>
+
+    <details>
+      <summary>Details & evidence</summary>
+      <pre>${escapeHtml(JSON.stringify(r.evidence || {}, null, 2))}</pre>
+      <div class="footerNote">
+        VeriScan provides probabilistic analysis based on available signals. This is not a definitive verdict.
+      </div>
+    </details>
+  `);
+}
+
+async function copyShare(){
+  if (!shareUrl) return;
+  const full = `${location.origin}${shareUrl}`;
+  try{
+    await navigator.clipboard.writeText(full);
+    setStatus(true, `<b>Status:</b> ready`, `<span class="muted tiny">Copied share link to clipboard</span>`, false);
+  }catch(e){
+    setStatus(true, `<b>Status:</b> ready`, `<span class="muted tiny">Couldn’t copy automatically. Select and copy the link manually.</span>`, false);
+  }
+}
+
+function openShare(){
+  if (!shareUrl) return;
+  window.open(shareUrl, '_blank');
 }
 
 async function startScan() {
   const url = document.getElementById('url').value.trim();
-  if (!url) { showStatus("Please paste a URL first."); return; }
+  if (!url) { setStatus(true, "<b>Status:</b> input needed", "Paste a URL to scan.", false); return; }
 
-  document.getElementById('result').style.display = 'none';
+  clearResult();
   hideShare();
-  showStatus("Submitting scan...");
+  setStatus(true, "<b>Status:</b> submitting", "Sending URL to VeriScan…", true);
 
   const res = await fetch('/api/v1/scan/link', {
     method: 'POST',
@@ -82,33 +602,32 @@ async function startScan() {
   try { data = JSON.parse(raw); } catch (e) {}
 
   if (!res.ok) {
-    showStatus(`Scan failed: <b>${res.status}</b><br><span class="muted">${escapeHtml(raw)}</span>`);
+    setStatus(true, `<b>Status:</b> error`, `<span class="tiny muted">${escapeHtml(raw)}</span>`, false);
     return;
   }
   if (!data.scan_id) {
-    showStatus(`No scan_id returned.<br><span class="muted">${escapeHtml(raw)}</span>`);
+    setStatus(true, `<b>Status:</b> error`, `<span class="tiny muted">No scan_id returned.</span>`, false);
     return;
   }
 
   scanId = data.scan_id;
-  shareUrl = data.share_url || (`/result/${scanId}`);
-  showShare(shareUrl);
+  showShare(data.share_url || (`/result/${scanId}`));
 
   if (timer) clearInterval(timer);
-  timer = setInterval(poll, 800);
+  timer = setInterval(poll, 850);
   await poll();
 }
 
 async function startImageScan() {
   const fileInput = document.getElementById('img');
   if (!fileInput.files || fileInput.files.length === 0) {
-    showStatus("Please choose an image first.");
+    setStatus(true, "<b>Status:</b> input needed", "Choose an image to scan.", false);
     return;
   }
 
-  document.getElementById('result').style.display = 'none';
+  clearResult();
   hideShare();
-  showStatus("Uploading image...");
+  setStatus(true, "<b>Status:</b> uploading", "Uploading image to VeriScan…", true);
 
   const form = new FormData();
   form.append('image', fileInput.files[0]);
@@ -123,28 +642,24 @@ async function startImageScan() {
   try { data = JSON.parse(raw); } catch (e) {}
 
   if (!res.ok) {
-    showStatus(`Upload failed: <b>${res.status}</b><br><span class="muted">${escapeHtml(raw)}</span>`);
+    setStatus(true, `<b>Status:</b> error`, `<span class="tiny muted">${escapeHtml(raw)}</span>`, false);
     return;
   }
   if (!data.scan_id) {
-    showStatus(`Upload returned no scan_id.<br><span class="muted">${escapeHtml(raw)}</span>`);
+    setStatus(true, `<b>Status:</b> error`, `<span class="tiny muted">No scan_id returned.</span>`, false);
     return;
   }
 
   scanId = data.scan_id;
-  shareUrl = data.share_url || (`/result/${scanId}`);
-  showShare(shareUrl);
+  showShare(data.share_url || (`/result/${scanId}`));
 
   if (timer) clearInterval(timer);
-  timer = setInterval(poll, 800);
+  timer = setInterval(poll, 850);
   await poll();
 }
 
 async function poll() {
-  if (!scanId) {
-    showStatus("No scanId yet — scan did not return scan_id.");
-    return;
-  }
+  if (!scanId) return;
 
   const res = await fetch(`/api/v1/scan/${scanId}`);
   const raw = await res.text();
@@ -152,52 +667,25 @@ async function poll() {
   try { data = JSON.parse(raw); } catch (e) {}
 
   if (!res.ok) {
-    showStatus(`Poll failed: <b>${res.status}</b><br><span class="muted">${escapeHtml(raw)}</span>`);
+    setStatus(true, `<b>Status:</b> error`, `<span class="tiny muted">${escapeHtml(raw)}</span>`, false);
+    clearInterval(timer);
     return;
   }
 
-  showStatus(`Status: <b>${data.status}</b>`);
+  const st = data.status || 'unknown';
+  if (st === 'queued' || st === 'running') {
+    setStatus(true, `<b>Status:</b> ${escapeHtml(st)}`, "Analyzing…", true);
+  } else {
+    setStatus(true, `<b>Status:</b> ${escapeHtml(st)}`, "", false);
+  }
 
-  if (data.status === 'complete') {
+  if (st === 'complete') {
     clearInterval(timer);
     renderReport(data.report);
-  } else if (data.status === 'error') {
+  } else if (st === 'error') {
     clearInterval(timer);
-    showStatus(`Status: <b>error</b><br><span class="muted">${escapeHtml(data.error || '')}</span>`);
+    setStatus(true, `<b>Status:</b> error`, `<span class="tiny muted">${escapeHtml(data.error || '')}</span>`, false);
   }
-}
-
-function renderReport(r) {
-  showResult(`
-    <h2>Confidence: ${r.overall_score} (${r.band_label})</h2>
-    <p>${escapeHtml(r.summary_text)}</p>
-
-    <p><b>Badges:</b> ${(r.badges && r.badges.length) ? r.badges.map(escapeHtml).join(", ") : "None"}</p>
-
-    <details>
-      <summary>View Detailed Analysis</summary>
-
-      <p><b>Pillars</b></p>
-      <ul>
-        <li>Source Reliability: ${r.pillars.source}</li>
-        <li>Cross-Verification: ${r.pillars.cross_verify}</li>
-        <li>AI / Manipulation: ${r.pillars.ai_manip}</li>
-        <li>Context Integrity: ${r.pillars.context}</li>
-      </ul>
-
-      <p><b>Evidence</b></p>
-      <pre>${escapeHtml(JSON.stringify(r.evidence, null, 2))}</pre>
-    </details>
-
-    <p class="muted">VeriScan provides probabilistic analysis based on available signals. Results may evolve as new information emerges.</p>
-  `);
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
 }
 </script>
 </body>
