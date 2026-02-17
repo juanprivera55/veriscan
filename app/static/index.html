@@ -33,10 +33,9 @@
     .topbar{
       display:flex; gap:12px; align-items:center; justify-content:space-between;
       margin-bottom:18px;
+      flex-wrap:wrap;
     }
-    .brand{
-      display:flex; align-items:center; gap:10px;
-    }
+    .brand{ display:flex; align-items:center; gap:10px; }
     .logo{
       width:40px; height:40px; border-radius:14px;
       background: linear-gradient(135deg, rgba(120,150,255,.95), rgba(255,110,110,.75));
@@ -55,7 +54,7 @@
       font-size:12px;
       white-space:nowrap;
     }
-    .pill strong{ color:var(--text); font-weight:700; }
+    .pill strong{ color:var(--text); font-weight:800; }
 
     .grid{
       display:grid;
@@ -79,13 +78,14 @@
       border-bottom:1px solid var(--line);
       background: rgba(255,255,255,.03);
       display:flex; align-items:center; justify-content:space-between; gap:10px;
+      flex-wrap:wrap;
     }
     .card .hd h2{
       margin:0;
       font-size:14px;
       letter-spacing:.25px;
       color:#d9e4ff;
-      font-weight:750;
+      font-weight:800;
     }
     .card .bd{ padding:18px; }
 
@@ -133,7 +133,7 @@
       background: rgba(255,255,255,.08);
       color: var(--text);
       cursor:pointer;
-      font-weight:650;
+      font-weight:750;
       font-size:13px;
       transition: transform .06s ease, background .2s ease, border-color .2s ease;
       user-select:none;
@@ -150,11 +150,6 @@
     .btn.danger{
       background: rgba(255,110,110,.14);
       border-color: rgba(255,110,110,.35);
-    }
-
-    .examples .btn{
-      padding:9px 11px; font-size:12px; border-radius: 12px;
-      background: rgba(255,255,255,.06);
     }
 
     .statusBox{
@@ -201,24 +196,25 @@
     }
     .scoreTitle{
       display:flex; flex-direction:column; gap:6px;
+      max-width: 520px;
     }
     .scoreTitle h3{
       margin:0;
       font-size:18px;
       letter-spacing:.2px;
-      font-weight:800;
+      font-weight:900;
     }
     .chip{
       display:inline-flex; align-items:center; gap:8px;
       padding:7px 10px;
       border-radius: 999px;
       font-size:12px;
-      font-weight:800;
+      font-weight:900;
       border:1px solid var(--line);
       background: rgba(255,255,255,.06);
       width: fit-content;
     }
-    .chip strong{ font-weight:900; }
+    .chip strong{ font-weight:950; }
     .chip.strong{ border-color: rgba(60,220,150,.55); background: rgba(60,220,150,.12); }
     .chip.moderate{ border-color: rgba(255,210,90,.55); background: rgba(255,210,90,.12); }
     .chip.limited{ border-color: rgba(255,150,70,.55); background: rgba(255,150,70,.12); }
@@ -230,7 +226,7 @@
       max-width: 100%;
     }
     .meterTop{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
-    .meterTop .num{ font-size:28px; font-weight:900; letter-spacing:.3px; }
+    .meterTop .num{ font-size:28px; font-weight:950; letter-spacing:.3px; }
     .meterTop .lab{ font-size:12px; color:var(--muted); }
     .bar{
       height:12px;
@@ -254,7 +250,7 @@
       background: rgba(255,255,255,.06);
       font-size:12px;
       color: #dfe8ff;
-      font-weight:700;
+      font-weight:800;
     }
     .badge.good{ border-color: rgba(60,220,150,.50); background: rgba(60,220,150,.12); }
     .badge.warn{ border-color: rgba(255,210,90,.50); background: rgba(255,210,90,.12); }
@@ -277,7 +273,8 @@
       background: rgba(0,0,0,.18);
     }
     .mini .k{ font-size:12px; color: var(--muted); margin-bottom:6px; }
-    .mini .v{ font-size:16px; font-weight:850; }
+    .mini .v{ font-size:16px; font-weight:900; }
+    .mini .v.small{ font-size:13px; font-weight:800; }
 
     details{
       margin-top:14px;
@@ -287,7 +284,7 @@
     summary{
       cursor:pointer;
       color:#dbe7ff;
-      font-weight:800;
+      font-weight:900;
       font-size:13px;
     }
     pre{
@@ -329,7 +326,7 @@
       <div class="card">
         <div class="hd">
           <h2>Run a Scan</h2>
-          <div class="pill tiny">Tip: start with a specific article (not a homepage)</div>
+          <div class="pill tiny">Tip: a specific article works best</div>
         </div>
         <div class="bd">
           <div class="field">
@@ -485,88 +482,6 @@ function badgeStyle(name){
   return 'neutral';
 }
 
-function renderReport(r){
-  const score = r.overall_score ?? 0;
-  const label = r.band_label ?? 'Uncertain';
-  const cls = bandClass(label);
-
-  const badges = (r.badges && r.badges.length)
-    ? `<div class="badges">${r.badges.map(b => `<span class="badge ${badgeStyle(b)}">${escapeHtml(b)}</span>`).join('')}</div>`
-    : `<div class="badges"><span class="badge neutral">No badges</span></div>`;
-
-  const signals = (r.evidence && r.evidence.signals) ? r.evidence.signals : {};
-  const corroHits = signals.corroboration_hits;
-  const corroDomains = signals.corroboration_domains || [];
-  const domainAge = signals.domain_age_days;
-
-  const corroText = (typeof corroHits === 'number')
-    ? `${corroHits} trusted domain(s) ${corroDomains.length ? `(${corroDomains.slice(0,4).join(', ')}${corroDomains.length>4?'…':''})` : ''}`
-    : 'Unavailable';
-
-  const ageText = (typeof domainAge === 'number')
-    ? `${domainAge.toLocaleString()} days`
-    : 'Unknown';
-
-  const src = r.pillars?.source ?? 50;
-  const cross = r.pillars?.cross_verify ?? 50;
-  const ai = r.pillars?.ai_manip ?? 50;
-  const ctx = r.pillars?.context ?? 50;
-
-  showResult(`
-    <div class="scoreTop">
-      <div class="scoreTitle">
-        <h3>Confidence Score</h3>
-        <div class="chip ${cls}"><strong>${score}</strong> • ${escapeHtml(label)}</div>
-        <div class="muted tiny">${escapeHtml(r.summary_text || '')}</div>
-        ${badges}
-      </div>
-
-      <div class="meter">
-        <div class="meterTop">
-          <div class="num">${score}</div>
-          <div class="lab">0 = uncertain • 100 = strong</div>
-        </div>
-        <div class="bar"><div style="width:${Math.max(0, Math.min(100, score))}%;"></div></div>
-      </div>
-    </div>
-
-    <div class="miniGrid">
-      <div class="mini">
-        <div class="k">Trusted corroboration</div>
-        <div class="v">${escapeHtml(corroText)}</div>
-      </div>
-      <div class="mini">
-        <div class="k">Domain age</div>
-        <div class="v">${escapeHtml(ageText)}</div>
-      </div>
-      <div class="mini">
-        <div class="k">Source reliability</div>
-        <div class="v">${src}</div>
-      </div>
-      <div class="mini">
-        <div class="k">Cross-verification</div>
-        <div class="v">${cross}</div>
-      </div>
-      <div class="mini">
-        <div class="k">AI / manipulation</div>
-        <div class="v">${ai}</div>
-      </div>
-      <div class="mini">
-        <div class="k">Context integrity</div>
-        <div class="v">${ctx}</div>
-      </div>
-    </div>
-
-    <details>
-      <summary>Details & evidence</summary>
-      <pre>${escapeHtml(JSON.stringify(r.evidence || {}, null, 2))}</pre>
-      <div class="footerNote">
-        VeriScan provides probabilistic analysis based on available signals. This is not a definitive verdict.
-      </div>
-    </details>
-  `);
-}
-
 async function copyShare(){
   if (!shareUrl) return;
   const full = `${location.origin}${shareUrl}`;
@@ -581,6 +496,140 @@ async function copyShare(){
 function openShare(){
   if (!shareUrl) return;
   window.open(shareUrl, '_blank');
+}
+
+function renderReport(r){
+  const score = r.overall_score ?? 0;
+  const label = r.band_label ?? 'Uncertain';
+  const cls = bandClass(label);
+
+  const signals = (r.evidence && r.evidence.signals) ? r.evidence.signals : {};
+  const unavailable = (r.evidence && r.evidence.unavailable_signals) ? r.evidence.unavailable_signals : [];
+
+  const isLink = ("final_url" in signals) || ("domain" in signals) || ("https" in signals);
+  const isImage = ("phash" in signals) || ("width" in signals) || ("exif_present" in signals);
+
+  const badges = (r.badges && r.badges.length)
+    ? `<div class="badges">${r.badges.map(b => `<span class="badge ${badgeStyle(b)}">${escapeHtml(b)}</span>`).join('')}</div>`
+    : `<div class="badges"><span class="badge neutral">No badges</span></div>`;
+
+  const src = r.pillars?.source ?? 50;
+  const cross = r.pillars?.cross_verify ?? 50;
+  const ai = r.pillars?.ai_manip ?? 50;
+  const ctx = r.pillars?.context ?? 50;
+
+  const yesNo = (v) => (v === true ? "Yes" : v === false ? "No" : "—");
+  const fmtDays = (d) => (typeof d === "number" ? `${d.toLocaleString()} days` : "Unknown");
+  const fmtCount = (n) => (typeof n === "number" ? n.toLocaleString() : "—");
+  const fmtText = (t) => (t ? escapeHtml(String(t)) : "—");
+
+  const finalUrl = signals.final_url || "—";
+  const domain = signals.domain || "—";
+  const https = signals.https;
+  const blocked = signals.blocked;
+  const domainAge = signals.domain_age_days;
+  const outbound = signals.outbound_links_count;
+
+  const corroHits = signals.corroboration_hits;
+  const corroDomains = signals.corroboration_domains || [];
+  const corroQuery = signals.corroboration_query || "";
+
+  const corroLine =
+    (typeof corroHits === "number")
+      ? `${corroHits} trusted domain(s)${corroDomains.length ? ` — ${corroDomains.slice(0,6).join(", ")}${corroDomains.length>6?"…":""}` : ""}`
+      : "Unavailable";
+
+  const w = signals.width, h = signals.height;
+  const exif = signals.exif_present;
+  const exifSoft = signals.exif_software;
+  const phash = signals.phash;
+
+  let meaning = r.summary_text || "";
+  if (isLink && blocked === true) {
+    meaning += " Some sites block automated access; results are based on domain-level signals only.";
+  }
+  if (isLink && typeof corroHits === "number" && corroHits === 0) {
+    meaning += " No matches were found on the trusted corroboration list (this does not automatically mean false).";
+  }
+
+  let keyFactsHtml = "";
+  if (isLink) {
+    keyFactsHtml = `
+      <div class="miniGrid">
+        <div class="mini"><div class="k">Final URL</div><div class="v small" style="word-break:break-all;">${fmtText(finalUrl)}</div></div>
+        <div class="mini"><div class="k">Domain</div><div class="v">${fmtText(domain)}</div></div>
+        <div class="mini"><div class="k">HTTPS</div><div class="v">${yesNo(https)}</div></div>
+        <div class="mini"><div class="k">Blocked by site</div><div class="v">${yesNo(blocked)}</div></div>
+        <div class="mini"><div class="k">Domain age</div><div class="v">${fmtDays(domainAge)}</div></div>
+        <div class="mini"><div class="k">Outbound links</div><div class="v">${fmtCount(outbound)}</div></div>
+      </div>
+
+      <div style="margin-top:12px;" class="mini">
+        <div class="k">Trusted corroboration</div>
+        <div class="v">${escapeHtml(corroLine)}</div>
+        ${corroQuery ? `<div class="muted tiny" style="margin-top:6px;">Search query used: <span style="opacity:.9">${escapeHtml(corroQuery)}</span></div>` : ""}
+      </div>
+    `;
+  } else if (isImage) {
+    keyFactsHtml = `
+      <div class="miniGrid">
+        <div class="mini"><div class="k">Dimensions</div><div class="v">${(w && h) ? `${w} × ${h}` : "—"}</div></div>
+        <div class="mini"><div class="k">EXIF present</div><div class="v">${yesNo(exif)}</div></div>
+        <div class="mini"><div class="k">EXIF software</div><div class="v small" style="word-break:break-word;">${fmtText(exifSoft)}</div></div>
+        <div class="mini"><div class="k">Image fingerprint (pHash)</div><div class="v small">${fmtText(phash)}</div></div>
+      </div>
+    `;
+  } else {
+    keyFactsHtml = `<div class="mini"><div class="k">Key facts</div><div class="v">No structured signals found.</div></div>`;
+  }
+
+  const pillarsHtml = `
+    <div class="miniGrid" style="margin-top:12px;">
+      <div class="mini"><div class="k">Source reliability</div><div class="v">${src}</div></div>
+      <div class="mini"><div class="k">Cross-verification</div><div class="v">${cross}</div></div>
+      <div class="mini"><div class="k">AI / manipulation</div><div class="v">${ai}</div></div>
+      <div class="mini"><div class="k">Context integrity</div><div class="v">${ctx}</div></div>
+    </div>
+  `;
+
+  const techHtml = `
+    <details>
+      <summary>Show technical details (raw)</summary>
+      ${unavailable.length ? `<div class="muted tiny" style="margin-top:10px;">Unavailable signals: ${escapeHtml(unavailable.join(", "))}</div>` : ""}
+      <pre>${escapeHtml(JSON.stringify(r.evidence || {}, null, 2))}</pre>
+    </details>
+    <p class="muted tiny" style="margin-top:10px;">
+      VeriScan provides probabilistic analysis based on available signals. This is not a definitive verdict.
+    </p>
+  `;
+
+  showResult(`
+    <div class="scoreTop">
+      <div class="scoreTitle">
+        <h3>Confidence Score</h3>
+        <div class="chip ${cls}"><strong>${score}</strong> • ${escapeHtml(label)}</div>
+        <div class="muted tiny">${escapeHtml(meaning)}</div>
+        ${badges}
+      </div>
+
+      <div class="meter">
+        <div class="meterTop">
+          <div class="num">${score}</div>
+          <div class="lab">0 = uncertain • 100 = strong</div>
+        </div>
+        <div class="bar"><div style="width:${Math.max(0, Math.min(100, score))}%;"></div></div>
+      </div>
+    </div>
+
+    <div class="mini" style="margin-top:6px;">
+      <div class="k">Report summary</div>
+      <div class="v">${escapeHtml(r.summary_text || "—")}</div>
+    </div>
+
+    ${keyFactsHtml}
+    ${pillarsHtml}
+    ${techHtml}
+  `);
 }
 
 async function startScan() {
