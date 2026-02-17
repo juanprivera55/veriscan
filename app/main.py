@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 from datetime import datetime, timezone
 import uuid
 import asyncio
+import re
+
 import httpx
 from bs4 import BeautifulSoup
 import tldextract
@@ -28,6 +30,36 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 
 # In-memory cache for domain age (30-day TTL)
 DOMAIN_AGE_CACHE: dict[str, dict] = {}  # domain -> {"age_days": int|None, "fetched_at": datetime}
+
+# In-memory cache for corroboration results (short TTL so repeated scans are fast)
+CORRO_CACHE: dict[str, dict] = {}  # query -> {"hits": int, "domains": list[str], "fetched_at": datetime}
+
+# Trusted domains allowlist (keep small + defensible in V1)
+TRUSTED_DOMAINS = {
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "bbc.co.uk",
+    "npr.org",
+    "nytimes.com",
+    "washingtonpost.com",
+    "theguardian.com",
+    "cnn.com",
+    "wsj.com",
+    "bloomberg.com",
+    "cnbc.com",
+    "abcnews.go.com",
+    "nbcnews.com",
+    "usatoday.com",
+    "forbes.com",
+    "time.com",
+    "economist.com",
+    # Government/health (strong signal)
+    "who.int",
+    "cdc.gov",
+    "fda.gov",
+    "nih.gov",
+}
 
 
 def is_url_safe(url: str) -> bool:
@@ -111,6 +143,82 @@ async def rdap_domain_age_days(domain: str) -> int | None:
     return age_days
 
 
+def build_search_query(title: str) -> str:
+    """
+    Turn a headline into a compact search query.
+    Keep it short so it matches across outlets.
+    """
+    if not title:
+        return ""
+
+    # remove punctuation & collapse whitespace
+    cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", title)
+    words = [w.lower() for w in cleaned.split() if len(w) >= 4]
+
+    # remove ultra-common stop words (tiny list)
+    stop = {"this", "that", "with", "from", "will", "have", "your", "what", "when", "where", "said", "says"}
+    words = [w for w in words if w not in stop]
+
+    # keep first 6-8 keywords
+    return " ".join(words[:8])
+
+
+async def trusted_corroboration(query: str) -> dict:
+    """
+    Uses DuckDuckGo HTML search (demo-level) and counts unique trusted domains present in results.
+    Returns: {"hits": int, "domains": [..]}
+    """
+    if not query:
+        return {"hits": 0, "domains": []}
+
+    # cache for 12 hours
+    cached = CORRO_CACHE.get(query)
+    if cached:
+        fetched_at: datetime = cached.get("fetched_at")
+        if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 12 * 3600:
+            return {"hits": cached.get("hits", 0), "domains": cached.get("domains", [])}
+
+    url = "https://duckduckgo.com/html/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url, params={"q": query})
+            if r.status_code != 200:
+                return {"hits": 0, "domains": []}
+            html = r.text
+    except Exception:
+        return {"hits": 0, "domains": []}
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # DDG HTML results typically have links with class "result__a"
+    links = soup.select("a.result__a")
+    found = set()
+
+    for a in links[:15]:
+        href = a.get("href") or ""
+        # Some hrefs are redirect links; still usually include the real URL
+        dom = parse_domain(href)
+        if not dom:
+            continue
+
+        # Match allowlist by suffix: e.g. "bbc.co.uk" should match dom "bbc.co.uk"
+        for trusted in TRUSTED_DOMAINS:
+            if dom == trusted or dom.endswith("." + trusted) or trusted.endswith("." + dom):
+                found.add(trusted)
+                break
+
+    result = {"hits": len(found), "domains": sorted(found)}
+    CORRO_CACHE[query] = {"hits": result["hits"], "domains": result["domains"], "fetched_at": datetime.now(timezone.utc)}
+    return result
+
+
 async def fetch_extract(url: str) -> dict:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
@@ -137,6 +245,9 @@ async def fetch_extract(url: str) -> dict:
                 "domain": domain,
                 "domain_age_days": domain_age_days,
                 "blocked": True,
+                "corroboration_hits": None,
+                "corroboration_domains": [],
+                "corroboration_query": "",
             }
 
         r.raise_for_status()
@@ -158,6 +269,12 @@ async def fetch_extract(url: str) -> dict:
     domain = parse_domain(final_url)
     domain_age_days = await rdap_domain_age_days(domain) if domain else None
 
+    # Corroboration (trusted domains)
+    query = build_search_query(title)
+    corro = await trusted_corroboration(query)
+    corroboration_hits = corro.get("hits", 0)
+    corroboration_domains = corro.get("domains", [])
+
     return {
         "final_url": final_url,
         "title": title,
@@ -167,6 +284,9 @@ async def fetch_extract(url: str) -> dict:
         "domain": domain,
         "domain_age_days": domain_age_days,
         "blocked": False,
+        "corroboration_hits": corroboration_hits,
+        "corroboration_domains": corroboration_domains,
+        "corroboration_query": query,
     }
 
 
@@ -183,21 +303,35 @@ def score_link(signals: dict) -> dict:
 
     source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
 
-    # Not implemented yet in this hosted demo
-    cross_verify = 50
+    # Cross verification uses trusted corroboration hits
+    hits = signals.get("corroboration_hits")
+    if hits is None:
+        cross_verify = 50
+    else:
+        cross_verify = clamp(int(min(100, hits * 25)))  # 0->0,1->25,2->50,3->75,4+->100
+
+    # Not implemented yet in this demo
     ai_manip = 50
     context = 60 if signals.get("title") else 40
 
     overall = int(round(source * 0.30 + cross_verify * 0.35 + ai_manip * 0.20 + context * 0.15))
     overall = clamp(overall)
 
-    unavailable = ["CROSS_VERIFICATION", "AI_MANIPULATION"]
+    unavailable = ["AI_MANIPULATION"]
     if signals.get("domain_age_days") is None:
         unavailable.append("DOMAIN_AGE")
+    if signals.get("corroboration_hits") is None:
+        unavailable.append("CROSS_VERIFICATION")
 
     badges = []
     if signals.get("blocked"):
         badges.append("SITE_BLOCKED_AUTOMATION")
+
+    # Add a lightweight badge if corroboration is strong
+    if isinstance(hits, int) and hits >= 3:
+        badges.append("MULTI_SOURCE_CORROBORATION")
+    elif isinstance(hits, int) and hits == 0:
+        badges.append("NO_TRUSTED_CORROBORATION_FOUND")
 
     if signals.get("blocked"):
         summary = (
@@ -205,10 +339,16 @@ def score_link(signals: dict) -> dict:
             "but article content could not be fetched."
         )
     else:
-        summary = (
-            f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-            "Cross-verification and AI/manipulation are not enabled yet in this demo."
-        )
+        if isinstance(hits, int):
+            summary = (
+                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+                f"Trusted-source corroboration found: {hits} domain(s)."
+            )
+        else:
+            summary = (
+                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+                "Trusted-source corroboration is unavailable for this scan."
+            )
 
     return {
         "overall_score": overall,
@@ -259,6 +399,7 @@ def analyze_image(image_path: str) -> dict:
 
 
 def score_image(signals: dict) -> dict:
+    # Neutral for pillars we haven't implemented for pure image scans
     source = 50
     cross_verify = 50
     ai_manip = 50  # no model yet
