@@ -1,0 +1,178 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VeriScan Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; max-width: 820px; }
+    input { width: 100%; padding: 12px; font-size: 16px; }
+    button { padding: 12px 16px; font-size: 16px; margin-top: 10px; cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-top: 18px; }
+    .muted { color: #666; }
+    details { margin-top: 10px; }
+    pre { background: #f7f7f7; padding: 12px; border-radius: 10px; overflow: auto; }
+    hr { margin: 24px 0; }
+  </style>
+</head>
+<body>
+  <h1>VeriScan (Link + Image Demo)</h1>
+  <p class="muted">Scan. Analyze. Decide. — Clarity in a world of noise.</p>
+
+  <h3>Scan Link</h3>
+  <input id="url" placeholder="Paste an article URL (https://...)" />
+  <button onclick="startScan()">Scan Link</button>
+
+  <hr />
+
+  <h3>Scan Image</h3>
+  <input id="img" type="file" accept="image/*" />
+  <button onclick="startImageScan()">Scan Image</button>
+
+  <div id="status" class="card" style="display:none;"></div>
+  <div id="result" class="card" style="display:none;"></div>
+
+<script>
+let scanId = null;
+let timer = null;
+
+function showStatus(html) {
+  const s = document.getElementById('status');
+  s.style.display = 'block';
+  s.innerHTML = html;
+}
+
+function showResult(html) {
+  const r = document.getElementById('result');
+  r.style.display = 'block';
+  r.innerHTML = html;
+}
+
+async function startScan() {
+  const url = document.getElementById('url').value.trim();
+  if (!url) { showStatus("Please paste a URL first."); return; }
+
+  document.getElementById('result').style.display = 'none';
+  showStatus("Submitting scan...");
+
+  const res = await fetch('/api/v1/scan/link', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({url})
+  });
+
+  const raw = await res.text();
+  let data = {};
+  try { data = JSON.parse(raw); } catch (e) {}
+
+  if (!res.ok) {
+    showStatus(`Scan failed: <b>${res.status}</b><br><span class="muted">${raw}</span>`);
+    return;
+  }
+  if (!data.scan_id) {
+    showStatus(`No scan_id returned.<br><span class="muted">${raw}</span>`);
+    return;
+  }
+
+  scanId = data.scan_id;
+  if (timer) clearInterval(timer);
+  timer = setInterval(poll, 700);
+  await poll();
+}
+
+async function startImageScan() {
+  const fileInput = document.getElementById('img');
+  if (!fileInput.files || fileInput.files.length === 0) {
+    showStatus("Please choose an image first.");
+    return;
+  }
+
+  document.getElementById('result').style.display = 'none';
+  showStatus("Uploading image...");
+
+  const form = new FormData();
+  form.append('image', fileInput.files[0]);
+
+  const res = await fetch('/api/v1/scan/image/upload', {
+    method: 'POST',
+    body: form
+  });
+
+  const raw = await res.text();
+  let data = {};
+  try { data = JSON.parse(raw); } catch (e) {}
+
+  if (!res.ok) {
+    showStatus(`Upload failed: <b>${res.status}</b><br><span class="muted">${raw}</span>`);
+    return;
+  }
+  if (!data.scan_id) {
+    showStatus(`Upload returned no scan_id.<br><span class="muted">${raw}</span>`);
+    return;
+  }
+
+  scanId = data.scan_id;
+  if (timer) clearInterval(timer);
+  timer = setInterval(poll, 700);
+  await poll();
+}
+
+async function poll() {
+  if (!scanId) {
+    showStatus("No scanId yet — upload/scan did not return scan_id.");
+    return;
+  }
+
+  const res = await fetch(`/api/v1/scan/${scanId}`);
+  const raw = await res.text();
+  let data = {};
+  try { data = JSON.parse(raw); } catch (e) {}
+
+  if (!res.ok) {
+    showStatus(`Poll failed: <b>${res.status}</b><br><span class="muted">${raw}</span>`);
+    return;
+  }
+
+  showStatus(`Status: <b>${data.status}</b>`);
+
+  if (data.status === 'complete') {
+    clearInterval(timer);
+    renderReport(data.report);
+  } else if (data.status === 'error') {
+    clearInterval(timer);
+    showStatus(`Status: <b>error</b><br><span class="muted">${data.error || ''}</span>`);
+  }
+}
+
+function renderReport(r) {
+  showResult(`
+    <h2>Confidence: ${r.overall_score} (${r.band_label})</h2>
+    <p>${r.summary_text}</p>
+
+    <details>
+      <summary>View Detailed Analysis</summary>
+
+      <p><b>Pillars</b></p>
+      <ul>
+        <li>Source Reliability: ${r.pillars.source}</li>
+        <li>Cross-Verification: ${r.pillars.cross_verify}</li>
+        <li>AI / Manipulation: ${r.pillars.ai_manip}</li>
+        <li>Context Integrity: ${r.pillars.context}</li>
+      </ul>
+
+      <p><b>Evidence</b></p>
+      <pre>${escapeHtml(JSON.stringify(r.evidence, null, 2))}</pre>
+    </details>
+
+    <p class="muted">VeriScan provides probabilistic analysis based on available signals. Results may evolve as new information emerges.</p>
+  `);
+}
+
+function escapeHtml(str) {
+  return str
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+</script>
+</body>
+</html>
