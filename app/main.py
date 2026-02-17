@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import uuid
 import asyncio
 import re
+import json
 
 import httpx
 from bs4 import BeautifulSoup
@@ -31,10 +32,10 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 # In-memory cache for domain age (30-day TTL)
 DOMAIN_AGE_CACHE: dict[str, dict] = {}  # domain -> {"age_days": int|None, "fetched_at": datetime}
 
-# In-memory cache for corroboration results (short TTL so repeated scans are fast)
+# In-memory cache for corroboration results (short TTL)
 CORRO_CACHE: dict[str, dict] = {}  # cache_key -> {"hits": int, "domains": list[str], "fetched_at": datetime}
 
-# Trusted domains allowlist (keep small + defensible in V1)
+# Trusted domains allowlist
 TRUSTED_DOMAINS = {
     "reuters.com",
     "apnews.com",
@@ -54,7 +55,7 @@ TRUSTED_DOMAINS = {
     "forbes.com",
     "time.com",
     "economist.com",
-    # Government/health (strong signal)
+    # Government/health
     "who.int",
     "cdc.gov",
     "fda.gov",
@@ -144,39 +145,24 @@ async def rdap_domain_age_days(domain: str) -> int | None:
 
 
 def build_search_query(title: str) -> str:
-    """
-    Turn a headline into a compact search query.
-    Keep it short so it matches across outlets.
-    """
     if not title:
         return ""
-
     cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", title)
     words = [w.lower() for w in cleaned.split() if len(w) >= 4]
-
     stop = {"this", "that", "with", "from", "will", "have", "your", "what", "when", "where", "said", "says"}
     words = [w for w in words if w not in stop]
-
     return " ".join(words[:8])
 
 
 def _is_same_or_subdomain(candidate: str, base: str) -> bool:
-    # candidate == base OR candidate is a subdomain of base
     return candidate == base or candidate.endswith("." + base)
 
 
 async def trusted_corroboration(query: str, exclude_domain: str | None) -> dict:
-    """
-    Uses DuckDuckGo HTML search (demo-level) and counts unique trusted domains present in results,
-    excluding the scanned domain (and its subdomains) so corroboration means "other outlets".
-    Returns: {"hits": int, "domains": [..]}
-    """
     if not query:
         return {"hits": 0, "domains": []}
 
-    # Cache key includes exclude_domain to avoid mixing results
     cache_key = f"{query}||exclude={exclude_domain or ''}"
-
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -211,14 +197,11 @@ async def trusted_corroboration(query: str, exclude_domain: str | None) -> dict:
         dom = parse_domain(href)
         if not dom:
             continue
-
         dom = dom.lower()
 
-        # Exclude the scanned domain & its subdomains
         if exclude and _is_same_or_subdomain(dom, exclude):
             continue
 
-        # Match allowlist
         for trusted in TRUSTED_DOMAINS:
             t = trusted.lower()
             if dom == t or dom.endswith("." + t) or t.endswith("." + dom):
@@ -241,7 +224,6 @@ async def fetch_extract(url: str) -> dict:
     async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
         r = await client.get(url)
 
-        # If blocked, return minimal signals instead of crashing
         if r.status_code in (401, 403):
             final_url = str(r.url)
             https = final_url.startswith("https://")
@@ -280,11 +262,8 @@ async def fetch_extract(url: str) -> dict:
     domain = parse_domain(final_url)
     domain_age_days = await rdap_domain_age_days(domain) if domain else None
 
-    # Corroboration (trusted domains), excluding the scanned domain
     query = build_search_query(title)
     corro = await trusted_corroboration(query, exclude_domain=domain)
-    corroboration_hits = corro.get("hits", 0)
-    corroboration_domains = corro.get("domains", [])
 
     return {
         "final_url": final_url,
@@ -295,8 +274,8 @@ async def fetch_extract(url: str) -> dict:
         "domain": domain,
         "domain_age_days": domain_age_days,
         "blocked": False,
-        "corroboration_hits": corroboration_hits,
-        "corroboration_domains": corroboration_domains,
+        "corroboration_hits": corro.get("hits", 0),
+        "corroboration_domains": corro.get("domains", []),
         "corroboration_query": query,
     }
 
@@ -310,15 +289,12 @@ def score_link(signals: dict) -> dict:
         domain_age_score = 50
     else:
         years = domain_age_days / 365.0
-        domain_age_score = clamp(int(20 + min(75, years * 13)))  # ~1yr=33, 5yr~85, 10yr~95
+        domain_age_score = clamp(int(20 + min(75, years * 13)))
 
     source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
 
     hits = signals.get("corroboration_hits")
-    if hits is None:
-        cross_verify = 50
-    else:
-        cross_verify = clamp(int(min(100, hits * 25)))  # 0->0,1->25,2->50,3->75,4+->100
+    cross_verify = 50 if hits is None else clamp(int(min(100, hits * 25)))
 
     ai_manip = 50
     context = 60 if signals.get("title") else 40
@@ -347,16 +323,10 @@ def score_link(signals: dict) -> dict:
             "but article content could not be fetched."
         )
     else:
-        if isinstance(hits, int):
-            summary = (
-                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-                f"Trusted-source corroboration found: {hits} other trusted domain(s)."
-            )
-        else:
-            summary = (
-                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-                "Trusted-source corroboration is unavailable for this scan."
-            )
+        summary = (
+            f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+            f"Trusted-source corroboration found: {hits if isinstance(hits, int) else 'N/A'} other trusted domain(s)."
+        )
 
     return {
         "overall_score": overall,
@@ -485,7 +455,7 @@ async def create_link_scan(payload: dict):
 
     asyncio.create_task(run_link_scan(scan_id, url))
 
-    return {"scan_id": scan_id, "status": "queued"}
+    return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
 
 
 @app.post("/api/v1/scan/image/upload", status_code=202)
@@ -505,13 +475,13 @@ async def create_image_scan(image: UploadFile = File(...)):
 
     if len(data) > 10 * 1024 * 1024:
         SCANS[scan_id] = {"status": "error", "error": "Image too large (max 10MB)"}
-        return {"scan_id": scan_id, "status": "queued"}
+        return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
 
     path.write_bytes(data)
 
     asyncio.create_task(run_image_scan(scan_id, str(path)))
 
-    return {"scan_id": scan_id, "status": "queued"}
+    return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
 
 
 @app.get("/api/v1/scan/{scan_id}")
@@ -520,4 +490,103 @@ def get_scan(scan_id: str):
     if not item:
         raise HTTPException(status_code=404, detail="Not found")
     return {"scan_id": scan_id, **item}
+
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+@app.get("/result/{scan_id}", response_class=HTMLResponse)
+def result_page(scan_id: str):
+    # Page loads even if scan isn't ready yet; it will poll and render.
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VeriScan Result</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 40px; max-width: 900px; }}
+    .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-top: 18px; }}
+    .muted {{ color: #666; }}
+    pre {{ background: #f7f7f7; padding: 12px; border-radius: 10px; overflow: auto; }}
+    a {{ color: #0b57d0; }}
+  </style>
+</head>
+<body>
+  <h1>VeriScan Result</h1>
+  <p class="muted">Shareable report link. This demo may reset if the server restarts.</p>
+
+  <div class="card">
+    <div><b>Scan ID:</b> {_html_escape(scan_id)}</div>
+    <div class="muted">Link: <a href="/result/{_html_escape(scan_id)}">/result/{_html_escape(scan_id)}</a></div>
+  </div>
+
+  <div id="status" class="card">Loading status…</div>
+  <div id="result" class="card" style="display:none;"></div>
+
+<script>
+const scanId = {json.dumps(scan_id)};
+let timer = null;
+
+function esc(s) {{
+  return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+}}
+
+async function poll() {{
+  const res = await fetch(`/api/v1/scan/${{scanId}}`);
+  const raw = await res.text();
+  let data = {{}};
+  try {{ data = JSON.parse(raw); }} catch(e) {{}}
+
+  if (!res.ok) {{
+    document.getElementById('status').innerHTML = `Could not load scan: <b>${{res.status}}</b><br><span class="muted">${{esc(raw)}}</span>`;
+    clearInterval(timer);
+    return;
+  }}
+
+  document.getElementById('status').innerHTML = `Status: <b>${{data.status}}</b>`;
+
+  if (data.status === "complete") {{
+    clearInterval(timer);
+    renderReport(data.report);
+  }} else if (data.status === "error") {{
+    clearInterval(timer);
+    document.getElementById('status').innerHTML += `<div class="muted">${{esc(data.error || "")}}</div>`;
+  }}
+}}
+
+function renderReport(r) {{
+  const el = document.getElementById('result');
+  el.style.display = 'block';
+  el.innerHTML = `
+    <h2>Confidence: ${{r.overall_score}} (${{r.band_label}})</h2>
+    <p>${{esc(r.summary_text)}}</p>
+
+    <p><b>Badges:</b> ${{(r.badges && r.badges.length) ? r.badges.map(esc).join(", ") : "None"}}</p>
+
+    <details>
+      <summary>View Detailed Analysis</summary>
+      <p><b>Pillars</b></p>
+      <ul>
+        <li>Source Reliability: ${{r.pillars.source}}</li>
+        <li>Cross-Verification: ${{r.pillars.cross_verify}}</li>
+        <li>AI / Manipulation: ${{r.pillars.ai_manip}}</li>
+        <li>Context Integrity: ${{r.pillars.context}}</li>
+      </ul>
+
+      <p><b>Evidence</b></p>
+      <pre>${{esc(JSON.stringify(r.evidence, null, 2))}}</pre>
+    </details>
+
+    <p class="muted">VeriScan provides probabilistic analysis based on available signals. Results may evolve as new information emerges.</p>
+  `;
+}}
+
+timer = setInterval(poll, 900);
+poll();
+</script>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
 

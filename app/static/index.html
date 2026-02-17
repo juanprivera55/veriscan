@@ -12,10 +12,11 @@
     details { margin-top: 10px; }
     pre { background: #f7f7f7; padding: 12px; border-radius: 10px; overflow: auto; }
     hr { margin: 24px 0; }
+    a { color: #0b57d0; }
   </style>
 </head>
 <body>
-  <h1>VeriScan (Link + Image Demo)</h1>
+  <h1>VeriScan (Shareable Results)</h1>
   <p class="muted">Scan. Analyze. Decide. — Clarity in a world of noise.</p>
 
   <h3>Scan Link</h3>
@@ -29,16 +30,31 @@
   <button onclick="startImageScan()">Scan Image</button>
 
   <div id="status" class="card" style="display:none;"></div>
+  <div id="share" class="card" style="display:none;"></div>
   <div id="result" class="card" style="display:none;"></div>
 
 <script>
 let scanId = null;
+let shareUrl = null;
 let timer = null;
 
 function showStatus(html) {
   const s = document.getElementById('status');
   s.style.display = 'block';
   s.innerHTML = html;
+}
+
+function showShare(url) {
+  const el = document.getElementById('share');
+  el.style.display = 'block';
+  const full = `${location.origin}${url}`;
+  el.innerHTML = `<b>Share this result:</b> <a href="${url}" target="_blank">${full}</a>`;
+}
+
+function hideShare() {
+  const el = document.getElementById('share');
+  el.style.display = 'none';
+  el.innerHTML = '';
 }
 
 function showResult(html) {
@@ -52,6 +68,7 @@ async function startScan() {
   if (!url) { showStatus("Please paste a URL first."); return; }
 
   document.getElementById('result').style.display = 'none';
+  hideShare();
   showStatus("Submitting scan...");
 
   const res = await fetch('/api/v1/scan/link', {
@@ -65,17 +82,20 @@ async function startScan() {
   try { data = JSON.parse(raw); } catch (e) {}
 
   if (!res.ok) {
-    showStatus(`Scan failed: <b>${res.status}</b><br><span class="muted">${raw}</span>`);
+    showStatus(`Scan failed: <b>${res.status}</b><br><span class="muted">${escapeHtml(raw)}</span>`);
     return;
   }
   if (!data.scan_id) {
-    showStatus(`No scan_id returned.<br><span class="muted">${raw}</span>`);
+    showStatus(`No scan_id returned.<br><span class="muted">${escapeHtml(raw)}</span>`);
     return;
   }
 
   scanId = data.scan_id;
+  shareUrl = data.share_url || (`/result/${scanId}`);
+  showShare(shareUrl);
+
   if (timer) clearInterval(timer);
-  timer = setInterval(poll, 700);
+  timer = setInterval(poll, 800);
   await poll();
 }
 
@@ -87,6 +107,7 @@ async function startImageScan() {
   }
 
   document.getElementById('result').style.display = 'none';
+  hideShare();
   showStatus("Uploading image...");
 
   const form = new FormData();
@@ -102,23 +123,26 @@ async function startImageScan() {
   try { data = JSON.parse(raw); } catch (e) {}
 
   if (!res.ok) {
-    showStatus(`Upload failed: <b>${res.status}</b><br><span class="muted">${raw}</span>`);
+    showStatus(`Upload failed: <b>${res.status}</b><br><span class="muted">${escapeHtml(raw)}</span>`);
     return;
   }
   if (!data.scan_id) {
-    showStatus(`Upload returned no scan_id.<br><span class="muted">${raw}</span>`);
+    showStatus(`Upload returned no scan_id.<br><span class="muted">${escapeHtml(raw)}</span>`);
     return;
   }
 
   scanId = data.scan_id;
+  shareUrl = data.share_url || (`/result/${scanId}`);
+  showShare(shareUrl);
+
   if (timer) clearInterval(timer);
-  timer = setInterval(poll, 700);
+  timer = setInterval(poll, 800);
   await poll();
 }
 
 async function poll() {
   if (!scanId) {
-    showStatus("No scanId yet — upload/scan did not return scan_id.");
+    showStatus("No scanId yet — scan did not return scan_id.");
     return;
   }
 
@@ -128,7 +152,7 @@ async function poll() {
   try { data = JSON.parse(raw); } catch (e) {}
 
   if (!res.ok) {
-    showStatus(`Poll failed: <b>${res.status}</b><br><span class="muted">${raw}</span>`);
+    showStatus(`Poll failed: <b>${res.status}</b><br><span class="muted">${escapeHtml(raw)}</span>`);
     return;
   }
 
@@ -139,14 +163,16 @@ async function poll() {
     renderReport(data.report);
   } else if (data.status === 'error') {
     clearInterval(timer);
-    showStatus(`Status: <b>error</b><br><span class="muted">${data.error || ''}</span>`);
+    showStatus(`Status: <b>error</b><br><span class="muted">${escapeHtml(data.error || '')}</span>`);
   }
 }
 
 function renderReport(r) {
   showResult(`
     <h2>Confidence: ${r.overall_score} (${r.band_label})</h2>
-    <p>${r.summary_text}</p>
+    <p>${escapeHtml(r.summary_text)}</p>
+
+    <p><b>Badges:</b> ${(r.badges && r.badges.length) ? r.badges.map(escapeHtml).join(", ") : "None"}</p>
 
     <details>
       <summary>View Detailed Analysis</summary>
@@ -168,7 +194,7 @@ function renderReport(r) {
 }
 
 function escapeHtml(str) {
-  return str
+  return String(str)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
