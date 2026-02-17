@@ -18,7 +18,6 @@ from PIL import Image, ImageDraw, ImageFont
 import imagehash
 import piexif
 
-# DB drivers
 import sqlite3
 
 try:
@@ -29,21 +28,18 @@ except Exception:
     RealDictCursor = None
 
 
-BASE_DIR = Path(__file__).resolve().parent          # .../veriscan/app
-STATIC_DIR = BASE_DIR / "static"                    # .../veriscan/app/static
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
 
-# Uploads folder (local disk in the container)
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
-# In-memory caches (safe to keep in RAM)
 DOMAIN_AGE_CACHE: dict[str, dict] = {}
 CORRO_CACHE: dict[str, dict] = {}
 
-# Trusted domains allowlist
 TRUSTED_DOMAINS = {
     "reuters.com",
     "apnews.com",
@@ -69,20 +65,14 @@ TRUSTED_DOMAINS = {
     "nih.gov",
 }
 
-# -------------------------
-# DB: Postgres on Render, fallback to SQLite locally
-# -------------------------
-
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = str((BASE_DIR / "veriscan.db").resolve())
-
 POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
 
 def _pg_connect():
     if not psycopg2:
         raise RuntimeError("psycopg2 not installed. Add psycopg2-binary to requirements.txt")
-    # psycopg2 accepts postgres:// but some environments prefer postgresql://
     dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     return psycopg2.connect(dsn)
 
@@ -94,10 +84,6 @@ def _sqlite_connect():
 
 
 def db_init():
-    """
-    Creates the scans table if it doesn't exist.
-    Runs on startup.
-    """
     if POSTGRES:
         conn = _pg_connect()
         try:
@@ -180,12 +166,7 @@ def db_get_scan(scan_id: str) -> dict | None:
                 if not row:
                     return None
                 report = json.loads(row["report_json"]) if row.get("report_json") else None
-                return {
-                    "scan_id": row["scan_id"],
-                    "status": row["status"],
-                    "report": report,
-                    "error": row.get("error_text"),
-                }
+                return {"scan_id": row["scan_id"], "status": row["status"], "report": report, "error": row.get("error_text")}
         finally:
             conn.close()
     else:
@@ -196,12 +177,7 @@ def db_get_scan(scan_id: str) -> dict | None:
             if not row:
                 return None
             report = json.loads(row["report_json"]) if row["report_json"] else None
-            return {
-                "scan_id": row["scan_id"],
-                "status": row["status"],
-                "report": report,
-                "error": row["error_text"],
-            }
+            return {"scan_id": row["scan_id"], "status": row["status"], "report": report, "error": row["error_text"]}
         finally:
             conn.close()
 
@@ -210,10 +186,6 @@ def db_get_scan(scan_id: str) -> dict | None:
 def _startup():
     db_init()
 
-
-# -------------------------
-# Helpers
-# -------------------------
 
 def is_url_safe(url: str) -> bool:
     p = urlparse(url)
@@ -484,16 +456,8 @@ def score_link(signals: dict) -> dict:
         "band_label": band_label(overall),
         "badges": badges,
         "summary_text": summary,
-        "pillars": {
-            "source": source,
-            "cross_verify": cross_verify,
-            "ai_manip": ai_manip,
-            "context": context,
-        },
-        "evidence": {
-            "signals": signals,
-            "unavailable_signals": unavailable,
-        },
+        "pillars": {"source": source, "cross_verify": cross_verify, "ai_manip": ai_manip, "context": context},
+        "evidence": {"signals": signals, "unavailable_signals": unavailable},
     }
 
 
@@ -550,17 +514,121 @@ def score_image(signals: dict) -> dict:
         "band_label": band_label(overall),
         "badges": [],
         "summary_text": summary,
-        "pillars": {
-            "source": source,
-            "cross_verify": cross_verify,
-            "ai_manip": ai_manip,
-            "context": context,
-        },
-        "evidence": {
-            "signals": signals,
-            "unavailable_signals": unavailable,
-        },
+        "pillars": {"source": source, "cross_verify": cross_verify, "ai_manip": ai_manip, "context": context},
+        "evidence": {"signals": signals, "unavailable_signals": unavailable},
     }
+
+
+# -------------------------
+# NEW: Explain this score (plain English)
+# -------------------------
+
+def build_explanation(report: dict) -> dict:
+    """
+    Turns report pillars + evidence into human-readable explanations.
+    Output format:
+      { highlights: [...], concerns: [...], missing: [...], guidance: "..." }
+    """
+    pillars = report.get("pillars") or {}
+    evidence = report.get("evidence") or {}
+    signals = evidence.get("signals") or {}
+    missing = evidence.get("unavailable_signals") or []
+
+    highlights = []
+    concerns = []
+    missing_items = []
+
+    # Identify scan type
+    is_link = ("final_url" in signals) or ("domain" in signals) or ("https" in signals)
+    is_image = ("phash" in signals) or ("width" in signals) or ("exif_present" in signals)
+
+    # Cross verification
+    hits = signals.get("corroboration_hits")
+    if isinstance(hits, int):
+        if hits >= 3:
+            highlights.append(f"Multiple trusted sources appear to cover similar facts ({hits} matched trusted domain(s)).")
+        elif hits == 1 or hits == 2:
+            highlights.append(f"Some trusted corroboration exists ({hits} matched trusted domain(s)).")
+        elif hits == 0:
+            concerns.append("No matches were found on the trusted corroboration list (not proof of falsehood, but less support).")
+    else:
+        missing_items.append("Trusted corroboration check was unavailable for this scan.")
+
+    # Domain age
+    age_days = signals.get("domain_age_days")
+    if age_days is None:
+        missing_items.append("Domain age could not be determined.")
+    else:
+        if age_days >= 3650:  # ~10 years
+            highlights.append("The domain is long-established (older domains are harder to spoof at scale).")
+        elif age_days < 180:
+            concerns.append("The domain is relatively new (new domains are more commonly used for spam/misinformation).")
+
+    # HTTPS
+    https = signals.get("https")
+    if https is True:
+        highlights.append("The link uses HTTPS (basic transport security).")
+    elif https is False and is_link:
+        concerns.append("The link is not using HTTPS (higher risk).")
+
+    # Blocked
+    if signals.get("blocked") is True:
+        concerns.append("The site blocked automated access; analysis relied more on domain-level signals.")
+    elif is_link and signals.get("title"):
+        highlights.append("Page title/content signals were available for analysis.")
+
+    # Outbound links / citations proxy
+    out = signals.get("outbound_links_count")
+    if isinstance(out, int):
+        if out >= 15:
+            highlights.append("The page links out to multiple references (a weak proxy for citations).")
+        elif out <= 1 and is_link and signals.get("blocked") is False:
+            concerns.append("Few or no outbound links were detected (less transparent sourcing).")
+
+    # Image EXIF
+    if is_image:
+        exif_present = signals.get("exif_present")
+        if exif_present is True:
+            highlights.append("The image contains EXIF metadata (can help with provenance, though it can be edited).")
+        elif exif_present is False:
+            concerns.append("The image has no EXIF metadata (common after re-uploads/edits; reduces provenance clues).")
+
+        if signals.get("exif_software"):
+            concerns.append("Editing software is listed in metadata (could be normal, but can indicate manipulation).")
+
+    # Missing list (normalize)
+    for m in missing:
+        if m == "AI_MANIPULATION":
+            missing_items.append("AI/manipulation classification is not enabled in this demo.")
+        elif m == "REVERSE_IMAGE":
+            missing_items.append("Reverse image search is not enabled in this demo.")
+        elif m == "CROSS_VERIFICATION":
+            missing_items.append("Cross-verification was not available for this scan.")
+        elif m == "DOMAIN_AGE":
+            missing_items.append("Domain age lookup was unavailable.")
+        else:
+            missing_items.append(m.replace("_", " ").title())
+
+    # Deduplicate while preserving order
+    def uniq(xs):
+        seen = set()
+        out = []
+        for x in xs:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    highlights = uniq(highlights)
+    concerns = uniq(concerns)
+    missing_items = uniq(missing_items)
+
+    guidance = (
+        "Treat this as a confidence signal, not a verdict. "
+        "If the claim is important, open 2–3 trusted outlets directly and compare details."
+    )
+
+    return {"highlights": highlights, "concerns": concerns, "missing": missing_items, "guidance": guidance}
 
 
 async def run_link_scan(scan_id: str, url: str):
@@ -568,6 +636,7 @@ async def run_link_scan(scan_id: str, url: str):
         db_upsert_scan(scan_id, "running")
         signals = await fetch_extract(url)
         report = score_link(signals)
+        report["explain"] = build_explanation(report)
         db_upsert_scan(scan_id, "complete", report=report)
     except Exception as e:
         db_upsert_scan(scan_id, "error", error=str(e))
@@ -578,6 +647,7 @@ async def run_image_scan(scan_id: str, path_str: str):
         db_upsert_scan(scan_id, "running")
         signals = analyze_image(path_str)
         report = score_image(signals)
+        report["explain"] = build_explanation(report)
         db_upsert_scan(scan_id, "complete", report=report)
     except Exception as e:
         db_upsert_scan(scan_id, "error", error=str(e))
@@ -636,17 +706,12 @@ def get_scan(scan_id: str):
     item = db_get_scan(scan_id)
     if not item:
         raise HTTPException(status_code=404, detail="Not found")
-    # Match existing response format
     resp = {"scan_id": scan_id, "status": item["status"]}
     if item["status"] == "complete":
         resp["report"] = item["report"]
     if item.get("error"):
         resp["error"] = item["error"]
     return resp
-
-
-def _html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _load_font(size: int) -> ImageFont.ImageFont:
@@ -697,17 +762,14 @@ def og_image(scan_id: str):
     panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
     img.paste(panel, (card_x, card_y), panel)
 
-    d.rounded_rectangle(
-        [card_x, card_y, card_x + card_w, card_y + card_h],
-        radius=26,
-        outline=(255, 255, 255, 45),
-        width=2
-    )
+    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
+                        radius=26, outline=(255, 255, 255, 45), width=2)
 
     logo_size = 70
     lx, ly = card_x + 38, card_y + 34
     d.rounded_rectangle([lx, ly, lx + logo_size, ly + logo_size], radius=22, fill=(120, 150, 255, 255))
-    d.rounded_rectangle([lx + 12, ly + 12, lx + logo_size - 12, ly + logo_size - 12], radius=18, fill=(255, 110, 110, 235))
+    d.rounded_rectangle([lx + 12, ly + 12, lx + logo_size - 12, ly + logo_size - 12],
+                        radius=18, fill=(255, 110, 110, 235))
 
     f_brand = _load_font(36)
     f_tag = _load_font(22)
@@ -761,7 +823,8 @@ def og_image(scan_id: str):
                             outline=(col[0], col[1], col[2], 180), width=2)
         d.text((chip_x + 18, chip_y + 12), b, font=f_band, fill=(234, 240, 255, 255))
 
-        d.line([content_x, content_y + 150, card_x + card_w - 38, content_y + 150], fill=(255, 255, 255, 35), width=2)
+        d.line([content_x, content_y + 150, card_x + card_w - 38, content_y + 150],
+               fill=(255, 255, 255, 35), width=2)
 
         summ = _truncate(summary or "Probabilistic analysis based on available signals.", 160)
         d.text((content_x, content_y + 175), summ, font=f_body, fill=(234, 240, 255, 255))
@@ -770,7 +833,8 @@ def og_image(scan_id: str):
         if dom:
             d.text((content_x, content_y + 235), f"Domain: {dom}", font=f_small, fill=(168, 179, 214, 255))
 
-    d.text((content_x, card_y + card_h - 48), f"veriscan • report id {scan_id[:8]}", font=f_small, fill=(168, 179, 214, 255))
+    d.text((content_x, card_y + card_h - 48), f"veriscan • report id {scan_id[:8]}",
+           font=f_small, fill=(168, 179, 214, 255))
 
     out = io.BytesIO()
     img.convert("RGB").save(out, format="PNG", optimize=True)
@@ -810,7 +874,6 @@ def result_page(scan_id: str, request: Request):
         og_title = "VeriScan Report — Not found"
         og_desc = "This link may have expired on the demo server."
 
-    # Share page HTML (same readable UI as before)
     html = f"""<!doctype html>
 <html>
 <head>
@@ -818,7 +881,6 @@ def result_page(scan_id: str, request: Request):
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{_html_escape(og_title)}</title>
 
-  <!-- Open Graph -->
   <meta property="og:title" content="{_html_escape(og_title)}" />
   <meta property="og:description" content="{_html_escape(og_desc)}" />
   <meta property="og:type" content="{_html_escape(og_type)}" />
@@ -827,7 +889,6 @@ def result_page(scan_id: str, request: Request):
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
 
-  <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="{_html_escape(og_title)}" />
   <meta name="twitter:description" content="{_html_escape(og_desc)}" />
@@ -924,6 +985,11 @@ def result_page(scan_id: str, request: Request):
     .mini .v{{ font-size:16px; font-weight:900; }}
     .mini .v.small{{ font-size:13px; font-weight:800; }}
 
+    .explainGrid{{ display:grid; grid-template-columns: 1fr; gap:10px; margin-top:12px; }}
+    .list{{ margin:8px 0 0; padding-left:18px; color: #eaf0ff; }}
+    .list li{{ margin:6px 0; }}
+    .hint{{ margin-top:10px; }}
+
     details{{ margin-top:14px; border-top:1px solid var(--line); padding-top:12px; }}
     summary{{ cursor:pointer; color:#dbe7ff; font-weight:900; font-size:13px; }}
     pre{{ margin-top:10px; padding:12px; border-radius:14px; background: rgba(0,0,0,.26); border: 1px solid var(--line);
@@ -998,6 +1064,40 @@ function copyLink(){{
   }}).catch(() => {{
     document.getElementById('statusSub').textContent = "Couldn’t copy automatically. Copy the URL from the address bar.";
   }});
+}}
+
+function renderExplain(explain){{
+  if (!explain) return '';
+
+  const h = (explain.highlights || []);
+  const c = (explain.concerns || []);
+  const m = (explain.missing || []);
+  const g = (explain.guidance || '');
+
+  const list = (items) => items.length
+    ? `<ul class="list">${items.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`
+    : `<div class="muted tiny">None</div>`;
+
+  return `
+    <div class="mini" style="margin-top:12px;">
+      <div class="k">Explain this score</div>
+      <div class="explainGrid">
+        <div class="mini" style="background: rgba(0,0,0,.12);">
+          <div class="k">What helped</div>
+          ${list(h)}
+        </div>
+        <div class="mini" style="background: rgba(0,0,0,.12);">
+          <div class="k">What raised concern</div>
+          ${list(c)}
+        </div>
+        <div class="mini" style="background: rgba(0,0,0,.12);">
+          <div class="k">What we couldn’t verify</div>
+          ${list(m)}
+        </div>
+        <div class="muted tiny hint">${esc(g)}</div>
+      </div>
+    </div>
+  `;
 }}
 
 function renderReadableReport(r){{
@@ -1105,6 +1205,8 @@ function renderReadableReport(r){{
     </p>
   `;
 
+  const explainHtml = renderExplain(r.explain);
+
   return `
     <div class="scoreTop">
       <div class="scoreTitle">
@@ -1130,6 +1232,7 @@ function renderReadableReport(r){{
 
     ${{keyFactsHtml}}
     ${{pillarsHtml}}
+    ${{explainHtml}}
     ${{techHtml}}
   `;
 }}
