@@ -1,10 +1,10 @@
-
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 import uuid
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 import tldextract
@@ -13,16 +13,16 @@ from PIL import Image
 import imagehash
 import piexif
 
-BASE_DIR = Path(__file__).resolve().parent          # ...\veriscan\app
-STATIC_DIR = BASE_DIR / "static"                    # ...\veriscan\app\static
+BASE_DIR = Path(__file__).resolve().parent          # .../veriscan/app
+STATIC_DIR = BASE_DIR / "static"                    # .../veriscan/app/static
 INDEX_FILE = STATIC_DIR / "index.html"
 
-app = FastAPI(title="VeriScan V1 Demo")
+app = FastAPI(title="VeriScan V1 Demo (Hosted)")
 
-# In-memory store for demo (replace with Postgres later)
+# In-memory store for demo (resets on restart)
 SCANS: dict[str, dict] = {}
 
-# Uploads folder (local demo storage)
+# Uploads folder (local disk in the container)
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
@@ -37,7 +37,6 @@ def is_url_safe(url: str) -> bool:
     host = (p.hostname or "").lower()
     if host in ("localhost",) or host.endswith(".local"):
         return False
-    # Minimal demo SSRF guard (production needs DNS resolution + private IP blocking)
     return True
 
 
@@ -113,7 +112,6 @@ async def rdap_domain_age_days(domain: str) -> int | None:
 
 
 async def fetch_extract(url: str) -> dict:
-    # Better headers reduce 401/403 on many sites (some will still block)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -121,7 +119,7 @@ async def fetch_extract(url: str) -> dict:
         "Referer": "https://www.google.com/",
     }
 
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
         r = await client.get(url)
 
         # If blocked, return minimal signals instead of crashing
@@ -185,7 +183,7 @@ def score_link(signals: dict) -> dict:
 
     source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
 
-    # Not implemented yet in this demo
+    # Not implemented yet in this hosted demo
     cross_verify = 50
     ai_manip = 50
     context = 60 if signals.get("title") else 40
@@ -201,14 +199,15 @@ def score_link(signals: dict) -> dict:
     if signals.get("blocked"):
         badges.append("SITE_BLOCKED_AUTOMATION")
 
-    summary = (
-        f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-        "Cross-verification and AI/manipulation are not enabled yet in this demo."
-    )
     if signals.get("blocked"):
         summary = (
             "This site blocked automated access. Domain and basic signals were still analyzed, "
             "but article content could not be fetched."
+        )
+    else:
+        summary = (
+            f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+            "Cross-verification and AI/manipulation are not enabled yet in this demo."
         )
 
     return {
@@ -260,12 +259,10 @@ def analyze_image(image_path: str) -> dict:
 
 
 def score_image(signals: dict) -> dict:
-    # Neutral for pillars we haven't implemented for pure image scans
     source = 50
     cross_verify = 50
-    ai_manip = 50  # no AI model yet
+    ai_manip = 50  # no model yet
 
-    # Context: slightly higher if EXIF exists; software tag can imply editing (informational)
     context = 65 if signals.get("exif_present") else 50
     if signals.get("exif_software"):
         context = min(80, context + 10)
@@ -298,6 +295,26 @@ def score_image(signals: dict) -> dict:
     }
 
 
+async def run_link_scan(scan_id: str, url: str):
+    try:
+        SCANS[scan_id] = {"status": "running"}
+        signals = await fetch_extract(url)
+        report = score_link(signals)
+        SCANS[scan_id] = {"status": "complete", "report": report}
+    except Exception as e:
+        SCANS[scan_id] = {"status": "error", "error": str(e)}
+
+
+async def run_image_scan(scan_id: str, path_str: str):
+    try:
+        SCANS[scan_id] = {"status": "running"}
+        signals = analyze_image(path_str)
+        report = score_image(signals)
+        SCANS[scan_id] = {"status": "complete", "report": report}
+    except Exception as e:
+        SCANS[scan_id] = {"status": "error", "error": str(e)}
+
+
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     return "ok"
@@ -317,14 +334,10 @@ async def create_link_scan(payload: dict):
         raise HTTPException(status_code=400, detail="Invalid or unsafe URL")
 
     scan_id = str(uuid.uuid4())
-    SCANS[scan_id] = {"status": "running"}
+    SCANS[scan_id] = {"status": "queued"}
 
-    try:
-        signals = await fetch_extract(url)
-        report = score_link(signals)
-        SCANS[scan_id] = {"status": "complete", "report": report}
-    except Exception as e:
-        SCANS[scan_id] = {"status": "error", "error": str(e)}
+    # Run in background so POST returns immediately (works better on Render)
+    asyncio.create_task(run_link_scan(scan_id, url))
 
     return {"scan_id": scan_id, "status": "queued"}
 
@@ -335,7 +348,7 @@ async def create_image_scan(image: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     scan_id = str(uuid.uuid4())
-    SCANS[scan_id] = {"status": "running"}
+    SCANS[scan_id] = {"status": "queued"}
 
     ext = (image.filename.split(".")[-1] if image.filename and "." in image.filename else "jpg").lower()
     if ext not in ("jpg", "jpeg", "png", "webp"):
@@ -350,12 +363,8 @@ async def create_image_scan(image: UploadFile = File(...)):
 
     path.write_bytes(data)
 
-    try:
-        signals = analyze_image(str(path))
-        report = score_image(signals)
-        SCANS[scan_id] = {"status": "complete", "report": report}
-    except Exception as e:
-        SCANS[scan_id] = {"status": "error", "error": str(e)}
+    # Run in background so POST returns immediately
+    asyncio.create_task(run_image_scan(scan_id, str(path)))
 
     return {"scan_id": scan_id, "status": "queued"}
 
@@ -366,3 +375,4 @@ def get_scan(scan_id: str):
     if not item:
         raise HTTPException(status_code=404, detail="Not found")
     return {"scan_id": scan_id, **item}
+
