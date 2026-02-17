@@ -1,33 +1,816 @@
-@app.get("/result/{scan_id}", response_class=HTMLResponse)
-def result_page(scan_id: str):
-    # Build OG/Twitter meta tags using whatever we have server-side.
-    item = SCANS.get(scan_id)
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from pathlib import Path
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+import uuid
+import asyncio
+import re
+import json
+import io
+import os
+
+import httpx
+from bs4 import BeautifulSoup
+import tldextract
+
+from PIL import Image, ImageDraw, ImageFont
+import imagehash
+import piexif
+
+# DB drivers
+import sqlite3
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except Exception:
+    psycopg2 = None
+    RealDictCursor = None
+
+
+BASE_DIR = Path(__file__).resolve().parent          # .../veriscan/app
+STATIC_DIR = BASE_DIR / "static"                    # .../veriscan/app/static
+INDEX_FILE = STATIC_DIR / "index.html"
+
+app = FastAPI(title="VeriScan V1 Demo (Hosted)")
+
+# Uploads folder (local disk in the container)
+UPLOADS_DIR = BASE_DIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+# In-memory caches (safe to keep in RAM)
+DOMAIN_AGE_CACHE: dict[str, dict] = {}
+CORRO_CACHE: dict[str, dict] = {}
+
+# Trusted domains allowlist
+TRUSTED_DOMAINS = {
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "bbc.co.uk",
+    "npr.org",
+    "nytimes.com",
+    "washingtonpost.com",
+    "theguardian.com",
+    "cnn.com",
+    "wsj.com",
+    "bloomberg.com",
+    "cnbc.com",
+    "abcnews.go.com",
+    "nbcnews.com",
+    "usatoday.com",
+    "forbes.com",
+    "time.com",
+    "economist.com",
+    "who.int",
+    "cdc.gov",
+    "fda.gov",
+    "nih.gov",
+}
+
+# -------------------------
+# DB: Postgres on Render, fallback to SQLite locally
+# -------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SQLITE_PATH = str((BASE_DIR / "veriscan.db").resolve())
+
+POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
+
+def _pg_connect():
+    if not psycopg2:
+        raise RuntimeError("psycopg2 not installed. Add psycopg2-binary to requirements.txt")
+    # psycopg2 accepts postgres:// but some environments prefer postgresql://
+    dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(dsn)
+
+
+def _sqlite_connect():
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db_init():
+    """
+    Creates the scans table if it doesn't exist.
+    Runs on startup.
+    """
+    if POSTGRES:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS scans (
+                    scan_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    report_json TEXT,
+                    error_text TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = _sqlite_connect()
+        try:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS scans (
+                scan_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                report_json TEXT,
+                error_text TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_upsert_scan(scan_id: str, status: str, report: dict | None = None, error: str | None = None):
+    report_json = json.dumps(report) if report is not None else None
+
+    if POSTGRES:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO scans (scan_id, status, report_json, error_text, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (scan_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    report_json = EXCLUDED.report_json,
+                    error_text = EXCLUDED.error_text,
+                    updated_at = NOW();
+                """, (scan_id, status, report_json, error))
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _sqlite_connect()
+        try:
+            conn.execute("""
+            INSERT INTO scans (scan_id, status, report_json, error_text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scan_id) DO UPDATE SET
+                status=excluded.status,
+                report_json=excluded.report_json,
+                error_text=excluded.error_text,
+                updated_at=excluded.updated_at;
+            """, (scan_id, status, report_json, error, now, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_get_scan(scan_id: str) -> dict | None:
+    if POSTGRES:
+        conn = _pg_connect()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT scan_id, status, report_json, error_text FROM scans WHERE scan_id = %s;", (scan_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                report = json.loads(row["report_json"]) if row.get("report_json") else None
+                return {
+                    "scan_id": row["scan_id"],
+                    "status": row["status"],
+                    "report": report,
+                    "error": row.get("error_text"),
+                }
+        finally:
+            conn.close()
+    else:
+        conn = _sqlite_connect()
+        try:
+            cur = conn.execute("SELECT scan_id, status, report_json, error_text FROM scans WHERE scan_id = ?;", (scan_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            report = json.loads(row["report_json"]) if row["report_json"] else None
+            return {
+                "scan_id": row["scan_id"],
+                "status": row["status"],
+                "report": report,
+                "error": row["error_text"],
+            }
+        finally:
+            conn.close()
+
+
+@app.on_event("startup")
+def _startup():
+    db_init()
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def is_url_safe(url: str) -> bool:
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower()
+    if host in ("localhost",) or host.endswith(".local"):
+        return False
+    return True
+
+
+def clamp(x: int) -> int:
+    return max(0, min(100, x))
+
+
+def band_label(score: int) -> str:
+    if score >= 80:
+        return "Strong"
+    if score >= 60:
+        return "Moderate"
+    if score >= 40:
+        return "Limited"
+    if score >= 20:
+        return "Weak"
+    return "Uncertain"
+
+
+def parse_domain(url: str) -> str | None:
+    ext = tldextract.extract(url)
+    if not ext.domain or not ext.suffix:
+        return None
+    return f"{ext.domain}.{ext.suffix}"
+
+
+def _parse_rdap_created(events: list[dict]) -> datetime | None:
+    for e in events or []:
+        action = (e.get("eventAction") or "").lower()
+        if action in ("registration", "created"):
+            dt = e.get("eventDate")
+            if not dt:
+                continue
+            try:
+                if dt.endswith("Z"):
+                    dt = dt[:-1] + "+00:00"
+                return datetime.fromisoformat(dt)
+            except Exception:
+                continue
+    return None
+
+
+async def rdap_domain_age_days(domain: str) -> int | None:
+    cached = DOMAIN_AGE_CACHE.get(domain)
+    if cached:
+        fetched_at: datetime = cached.get("fetched_at")
+        if fetched_at and (datetime.now(timezone.utc) - fetched_at).days < 30:
+            return cached.get("age_days")
+
+    url = f"https://rdap.org/domain/{domain}"
+    try:
+        async with httpx.AsyncClient(timeout=6.0, follow_redirects=True, headers={"User-Agent": "VeriScan/0.1"}) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                DOMAIN_AGE_CACHE[domain] = {"age_days": None, "fetched_at": datetime.now(timezone.utc)}
+                return None
+            data = r.json()
+    except Exception:
+        DOMAIN_AGE_CACHE[domain] = {"age_days": None, "fetched_at": datetime.now(timezone.utc)}
+        return None
+
+    created = _parse_rdap_created(data.get("events", []))
+    if not created:
+        DOMAIN_AGE_CACHE[domain] = {"age_days": None, "fetched_at": datetime.now(timezone.utc)}
+        return None
+
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+
+    age_days = max((datetime.now(timezone.utc) - created).days, 0)
+    DOMAIN_AGE_CACHE[domain] = {"age_days": age_days, "fetched_at": datetime.now(timezone.utc)}
+    return age_days
+
+
+def build_search_query(title: str) -> str:
+    if not title:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", title)
+    words = [w.lower() for w in cleaned.split() if len(w) >= 4]
+    stop = {"this", "that", "with", "from", "will", "have", "your", "what", "when", "where", "said", "says"}
+    words = [w for w in words if w not in stop]
+    return " ".join(words[:8])
+
+
+def _is_same_or_subdomain(candidate: str, base: str) -> bool:
+    return candidate == base or candidate.endswith("." + base)
+
+
+async def trusted_corroboration(query: str, exclude_domain: str | None) -> dict:
+    if not query:
+        return {"hits": 0, "domains": []}
+
+    cache_key = f"{query}||exclude={exclude_domain or ''}"
+    cached = CORRO_CACHE.get(cache_key)
+    if cached:
+        fetched_at: datetime = cached.get("fetched_at")
+        if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 12 * 3600:
+            return {"hits": cached.get("hits", 0), "domains": cached.get("domains", [])}
+
+    url = "https://duckduckgo.com/html/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://duckduckgo.com/",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url, params={"q": query})
+            if r.status_code != 200:
+                return {"hits": 0, "domains": []}
+            html = r.text
+    except Exception:
+        return {"hits": 0, "domains": []}
+
+    soup = BeautifulSoup(html, "html.parser")
+    links = soup.select("a.result__a")
+
+    found = set()
+    exclude = (exclude_domain or "").lower().strip()
+
+    for a in links[:15]:
+        href = a.get("href") or ""
+        dom = parse_domain(href)
+        if not dom:
+            continue
+        dom = dom.lower()
+
+        if exclude and _is_same_or_subdomain(dom, exclude):
+            continue
+
+        for trusted in TRUSTED_DOMAINS:
+            t = trusted.lower()
+            if dom == t or dom.endswith("." + t) or t.endswith("." + dom):
+                found.add(trusted)
+                break
+
+    result = {"hits": len(found), "domains": sorted(found)}
+    CORRO_CACHE[cache_key] = {"hits": result["hits"], "domains": result["domains"], "fetched_at": datetime.now(timezone.utc)}
+    return result
+
+
+async def fetch_extract(url: str) -> dict:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+    }
+
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
+        r = await client.get(url)
+
+        if r.status_code in (401, 403):
+            final_url = str(r.url)
+            https = final_url.startswith("https://")
+            domain = parse_domain(final_url)
+            domain_age_days = await rdap_domain_age_days(domain) if domain else None
+            return {
+                "final_url": final_url,
+                "title": "",
+                "text_snippet": "",
+                "outbound_links_count": 0,
+                "https": https,
+                "domain": domain,
+                "domain_age_days": domain_age_days,
+                "blocked": True,
+                "corroboration_hits": None,
+                "corroboration_domains": [],
+                "corroboration_query": "",
+            }
+
+        r.raise_for_status()
+        html = r.text
+        final_url = str(r.url)
+
+    soup = BeautifulSoup(html, "html.parser")
+    title = (soup.title.text.strip() if soup.title else "")[:300]
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = " ".join(soup.get_text(" ").split())
+    text_snippet = text[:800]
+    outbound_links = len([a for a in soup.find_all("a", href=True)])
+
+    https = final_url.startswith("https://")
+    domain = parse_domain(final_url)
+    domain_age_days = await rdap_domain_age_days(domain) if domain else None
+
+    query = build_search_query(title)
+    corro = await trusted_corroboration(query, exclude_domain=domain)
+
+    return {
+        "final_url": final_url,
+        "title": title,
+        "text_snippet": text_snippet,
+        "outbound_links_count": outbound_links,
+        "https": https,
+        "domain": domain,
+        "domain_age_days": domain_age_days,
+        "blocked": False,
+        "corroboration_hits": corro.get("hits", 0),
+        "corroboration_domains": corro.get("domains", []),
+        "corroboration_query": query,
+    }
+
+
+def score_link(signals: dict) -> dict:
+    https_score = 100 if signals.get("https") else 30
+    citations_score = clamp(min(100, int(signals.get("outbound_links_count", 0) * 4)))
+
+    domain_age_days = signals.get("domain_age_days")
+    if domain_age_days is None:
+        domain_age_score = 50
+    else:
+        years = domain_age_days / 365.0
+        domain_age_score = clamp(int(20 + min(75, years * 13)))
+
+    source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
+
+    hits = signals.get("corroboration_hits")
+    cross_verify = 50 if hits is None else clamp(int(min(100, hits * 25)))
+
+    ai_manip = 50
+    context = 60 if signals.get("title") else 40
+
+    overall = int(round(source * 0.30 + cross_verify * 0.35 + ai_manip * 0.20 + context * 0.15))
+    overall = clamp(overall)
+
+    unavailable = ["AI_MANIPULATION"]
+    if signals.get("domain_age_days") is None:
+        unavailable.append("DOMAIN_AGE")
+    if signals.get("corroboration_hits") is None:
+        unavailable.append("CROSS_VERIFICATION")
+
+    badges = []
+    if signals.get("blocked"):
+        badges.append("SITE_BLOCKED_AUTOMATION")
+
+    if isinstance(hits, int) and hits >= 3:
+        badges.append("MULTI_SOURCE_CORROBORATION")
+    elif isinstance(hits, int) and hits == 0:
+        badges.append("NO_TRUSTED_CORROBORATION_FOUND")
+
+    if signals.get("blocked"):
+        summary = (
+            "This site blocked automated access. Domain and basic signals were still analyzed, "
+            "but article content could not be fetched."
+        )
+    else:
+        summary = (
+            f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+            f"Trusted-source corroboration found: {hits if isinstance(hits, int) else 'N/A'} other trusted domain(s)."
+        )
+
+    return {
+        "overall_score": overall,
+        "band_label": band_label(overall),
+        "badges": badges,
+        "summary_text": summary,
+        "pillars": {
+            "source": source,
+            "cross_verify": cross_verify,
+            "ai_manip": ai_manip,
+            "context": context,
+        },
+        "evidence": {
+            "signals": signals,
+            "unavailable_signals": unavailable,
+        },
+    }
+
+
+def analyze_image(image_path: str) -> dict:
+    signals = {
+        "exif_present": False,
+        "exif_software": None,
+        "width": None,
+        "height": None,
+        "phash": None,
+    }
+
+    with Image.open(image_path) as img:
+        signals["width"], signals["height"] = img.size
+        signals["phash"] = str(imagehash.phash(img))
+
+    try:
+        exif_dict = piexif.load(image_path)
+        signals["exif_present"] = True if exif_dict and any(exif_dict.values()) else False
+
+        zeroth = exif_dict.get("0th", {})
+        software = zeroth.get(piexif.ImageIFD.Software)
+        if software:
+            if isinstance(software, bytes):
+                software = software.decode("utf-8", errors="ignore")
+            signals["exif_software"] = str(software)[:200]
+    except Exception:
+        signals["exif_present"] = False
+
+    return signals
+
+
+def score_image(signals: dict) -> dict:
+    source = 50
+    cross_verify = 50
+    ai_manip = 50
+
+    context = 65 if signals.get("exif_present") else 50
+    if signals.get("exif_software"):
+        context = min(80, context + 10)
+
+    overall = int(round(source * 0.30 + cross_verify * 0.35 + ai_manip * 0.20 + context * 0.15))
+    overall = clamp(overall)
+
+    unavailable = ["CROSS_VERIFICATION", "SOURCE_CONTEXT", "AI_MANIPULATION", "REVERSE_IMAGE"]
+
+    summary = (
+        "Image fingerprint and metadata extracted. Reverse image matches and AI/manipulation classification "
+        "are not enabled yet in this demo."
+    )
+
+    return {
+        "overall_score": overall,
+        "band_label": band_label(overall),
+        "badges": [],
+        "summary_text": summary,
+        "pillars": {
+            "source": source,
+            "cross_verify": cross_verify,
+            "ai_manip": ai_manip,
+            "context": context,
+        },
+        "evidence": {
+            "signals": signals,
+            "unavailable_signals": unavailable,
+        },
+    }
+
+
+async def run_link_scan(scan_id: str, url: str):
+    try:
+        db_upsert_scan(scan_id, "running")
+        signals = await fetch_extract(url)
+        report = score_link(signals)
+        db_upsert_scan(scan_id, "complete", report=report)
+    except Exception as e:
+        db_upsert_scan(scan_id, "error", error=str(e))
+
+
+async def run_image_scan(scan_id: str, path_str: str):
+    try:
+        db_upsert_scan(scan_id, "running")
+        signals = analyze_image(path_str)
+        report = score_image(signals)
+        db_upsert_scan(scan_id, "complete", report=report)
+    except Exception as e:
+        db_upsert_scan(scan_id, "error", error=str(e))
+
+
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    return "ok"
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    if not INDEX_FILE.exists():
+        return HTMLResponse(f"<h3>Missing:</h3><pre>{INDEX_FILE}</pre>", status_code=500)
+    return HTMLResponse(INDEX_FILE.read_text(encoding="utf-8"))
+
+
+@app.post("/api/v1/scan/link", status_code=202)
+async def create_link_scan(payload: dict):
+    url = (payload.get("url") or "").strip()
+    if not url or not is_url_safe(url):
+        raise HTTPException(status_code=400, detail="Invalid or unsafe URL")
+
+    scan_id = str(uuid.uuid4())
+    db_upsert_scan(scan_id, "queued")
+    asyncio.create_task(run_link_scan(scan_id, url))
+    return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
+
+
+@app.post("/api/v1/scan/image/upload", status_code=202)
+async def create_image_scan(image: UploadFile = File(...)):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    scan_id = str(uuid.uuid4())
+    db_upsert_scan(scan_id, "queued")
+
+    ext = (image.filename.split(".")[-1] if image.filename and "." in image.filename else "jpg").lower()
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        ext = "jpg"
+
+    path = UPLOADS_DIR / f"{scan_id}.{ext}"
+    data = await image.read()
+
+    if len(data) > 10 * 1024 * 1024:
+        db_upsert_scan(scan_id, "error", error="Image too large (max 10MB)")
+        return {"scan_id": scan_id, "status": "error", "share_url": f"/result/{scan_id}"}
+
+    path.write_bytes(data)
+    asyncio.create_task(run_image_scan(scan_id, str(path)))
+    return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
+
+
+@app.get("/api/v1/scan/{scan_id}")
+def get_scan(scan_id: str):
+    item = db_get_scan(scan_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Match existing response format
+    resp = {"scan_id": scan_id, "status": item["status"]}
+    if item["status"] == "complete":
+        resp["report"] = item["report"]
+    if item.get("error"):
+        resp["error"] = item["error"]
+    return resp
+
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    t = (text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[: max_chars - 1].rstrip() + "…"
+
+
+def _band_color(band: str) -> tuple[int, int, int]:
+    b = (band or "").lower()
+    if "strong" in b:
+        return (60, 220, 150)
+    if "moderate" in b:
+        return (255, 210, 90)
+    if "limited" in b:
+        return (255, 150, 70)
+    if "weak" in b:
+        return (255, 110, 110)
+    return (200, 210, 230)
+
+
+@app.get("/og/{scan_id}.png")
+def og_image(scan_id: str):
+    item = db_get_scan(scan_id)
     status = (item or {}).get("status", "not_found")
 
-    og_title = "VeriScan Report"
-    og_desc = "Scan. Analyze. Decide. — Clarity in a world of noise."
-    og_type = "website"
-    og_url = f"/result/{scan_id}"
+    W, H = 1200, 630
+    img = Image.new("RGB", (W, H), (11, 16, 32))
+    d = ImageDraw.Draw(img)
 
-    if status == "complete":
+    d.ellipse((-200, -220, 520, 420), fill=(32, 60, 160))
+    d.ellipse((760, -240, 1500, 420), fill=(120, 28, 48))
+
+    veil = Image.new("RGBA", (W, H), (11, 16, 32, 170))
+    img = Image.alpha_composite(img.convert("RGBA"), veil).convert("RGBA")
+    d = ImageDraw.Draw(img)
+
+    card_x, card_y = 70, 70
+    card_w, card_h = W - 140, H - 140
+    panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
+    img.paste(panel, (card_x, card_y), panel)
+
+    d.rounded_rectangle(
+        [card_x, card_y, card_x + card_w, card_y + card_h],
+        radius=26,
+        outline=(255, 255, 255, 45),
+        width=2
+    )
+
+    logo_size = 70
+    lx, ly = card_x + 38, card_y + 34
+    d.rounded_rectangle([lx, ly, lx + logo_size, ly + logo_size], radius=22, fill=(120, 150, 255, 255))
+    d.rounded_rectangle([lx + 12, ly + 12, lx + logo_size - 12, ly + logo_size - 12], radius=18, fill=(255, 110, 110, 235))
+
+    f_brand = _load_font(36)
+    f_tag = _load_font(22)
+    f_h1 = _load_font(52)
+    f_big = _load_font(84)
+    f_band = _load_font(30)
+    f_body = _load_font(26)
+    f_small = _load_font(22)
+
+    d.text((lx + logo_size + 18, ly + 2), "VeriScan", font=f_brand, fill=(234, 240, 255, 255))
+    d.text((lx + logo_size + 18, ly + 46), "Scan. Analyze. Decide.", font=f_tag, fill=(168, 179, 214, 255))
+
+    score = None
+    band = None
+    summary = None
+    domain = None
+
+    if status == "complete" and item:
         report = item.get("report") or {}
         score = report.get("overall_score")
         band = report.get("band_label")
         summary = (report.get("summary_text") or "").strip()
+        signals = ((report.get("evidence") or {}).get("signals") or {})
+        domain = signals.get("domain") or ""
 
+    content_x = card_x + 38
+    content_y = card_y + 140
+
+    if status in ("queued", "running"):
+        d.text((content_x, content_y), "Report processing…", font=f_h1, fill=(234, 240, 255, 255))
+        d.text((content_x, content_y + 70), "Check back in a moment.", font=f_body, fill=(168, 179, 214, 255))
+    elif status == "error":
+        d.text((content_x, content_y), "Report error", font=f_h1, fill=(234, 240, 255, 255))
+        d.text((content_x, content_y + 70), "Something went wrong generating this report.", font=f_body, fill=(168, 179, 214, 255))
+    elif status == "not_found":
+        d.text((content_x, content_y), "Report not found", font=f_h1, fill=(234, 240, 255, 255))
+        d.text((content_x, content_y + 70), "This link may have expired on the demo server.", font=f_body, fill=(168, 179, 214, 255))
+    else:
+        s = score if isinstance(score, int) else 0
+        b = band or "Uncertain"
+        col = _band_color(b)
+
+        d.text((content_x, content_y), "Confidence", font=f_body, fill=(168, 179, 214, 255))
+        d.text((content_x, content_y + 40), f"{s}", font=f_big, fill=(234, 240, 255, 255))
+
+        chip_x = content_x + 170
+        chip_y = content_y + 66
+        chip_w, chip_h = 260, 54
+        d.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=26,
+                            fill=(col[0], col[1], col[2], 60),
+                            outline=(col[0], col[1], col[2], 180), width=2)
+        d.text((chip_x + 18, chip_y + 12), b, font=f_band, fill=(234, 240, 255, 255))
+
+        d.line([content_x, content_y + 150, card_x + card_w - 38, content_y + 150], fill=(255, 255, 255, 35), width=2)
+
+        summ = _truncate(summary or "Probabilistic analysis based on available signals.", 160)
+        d.text((content_x, content_y + 175), summ, font=f_body, fill=(234, 240, 255, 255))
+
+        dom = (domain or "").strip()
+        if dom:
+            d.text((content_x, content_y + 235), f"Domain: {dom}", font=f_small, fill=(168, 179, 214, 255))
+
+    d.text((content_x, card_y + card_h - 48), f"veriscan • report id {scan_id[:8]}", font=f_small, fill=(168, 179, 214, 255))
+
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG", optimize=True)
+    out.seek(0)
+    return StreamingResponse(out, media_type="image/png")
+
+
+@app.get("/result/{scan_id}", response_class=HTMLResponse)
+def result_page(scan_id: str, request: Request):
+    item = db_get_scan(scan_id)
+    status = (item or {}).get("status", "not_found")
+
+    base = str(request.base_url).rstrip("/")
+    og_url = f"{base}/result/{scan_id}"
+    og_img = f"{base}/og/{scan_id}.png"
+
+    og_title = "VeriScan Report"
+    og_desc = "Scan. Analyze. Decide. — Clarity in a world of noise."
+    og_type = "website"
+
+    if status == "complete" and item:
+        report = item.get("report") or {}
+        score = report.get("overall_score")
+        band = report.get("band_label")
+        summary = (report.get("summary_text") or "").strip()
         if isinstance(score, int) and band:
             og_title = f"VeriScan Report — {score}/100 • {band}"
         if summary:
             og_desc = summary[:180]
-
     elif status in ("queued", "running"):
         og_title = "VeriScan Report — Processing…"
         og_desc = "This report is being generated. Check back in a moment."
     elif status == "error":
         og_title = "VeriScan Report — Error"
         og_desc = "There was an error generating this report."
+    else:
+        og_title = "VeriScan Report — Not found"
+        og_desc = "This link may have expired on the demo server."
 
-    # NOTE: We keep the page’s JS-driven UI, but OG tags are now server-rendered for link previews.
+    # Share page HTML (same readable UI as before)
     html = f"""<!doctype html>
 <html>
 <head>
@@ -40,16 +823,15 @@ def result_page(scan_id: str):
   <meta property="og:description" content="{_html_escape(og_desc)}" />
   <meta property="og:type" content="{_html_escape(og_type)}" />
   <meta property="og:url" content="{_html_escape(og_url)}" />
+  <meta property="og:image" content="{_html_escape(og_img)}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
 
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="{_html_escape(og_title)}" />
   <meta name="twitter:description" content="{_html_escape(og_desc)}" />
-
-  <!-- Optional: a simple in-app “preview image” endpoint you can add later:
-       <meta property="og:image" content="/og/{scan_id}.png" />
-       <meta name="twitter:image" content="/og/{scan_id}.png" />
-  -->
+  <meta name="twitter:image" content="{_html_escape(og_img)}" />
 
   <style>
     :root{{
@@ -107,7 +889,6 @@ def result_page(scan_id: str):
       animation: spin .8s linear infinite; }}
     @keyframes spin{{ to {{ transform: rotate(360deg); }} }}
 
-    /* Report UI styles (same as before) */
     .scoreTop{{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:12px; }}
     .scoreTitle{{ display:flex; flex-direction:column; gap:6px; max-width:520px; }}
     .scoreTitle h3{{ margin:0; font-size:18px; letter-spacing:.2px; font-weight:900; }}
@@ -119,6 +900,7 @@ def result_page(scan_id: str):
     .chip.limited{{ border-color: rgba(255,150,70,.55); background: rgba(255,150,70,.12); }}
     .chip.weak{{ border-color: rgba(255,110,110,.60); background: rgba(255,110,110,.12); }}
     .chip.uncertain{{ border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.06); }}
+
     .meter{{ width:320px; max-width:100%; }}
     .meterTop{{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }}
     .meterTop .num{{ font-size:28px; font-weight:950; }}
@@ -394,3 +1176,4 @@ poll();
 </body>
 </html>"""
     return HTMLResponse(html)
+
