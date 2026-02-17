@@ -32,7 +32,7 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 DOMAIN_AGE_CACHE: dict[str, dict] = {}  # domain -> {"age_days": int|None, "fetched_at": datetime}
 
 # In-memory cache for corroboration results (short TTL so repeated scans are fast)
-CORRO_CACHE: dict[str, dict] = {}  # query -> {"hits": int, "domains": list[str], "fetched_at": datetime}
+CORRO_CACHE: dict[str, dict] = {}  # cache_key -> {"hits": int, "domains": list[str], "fetched_at": datetime}
 
 # Trusted domains allowlist (keep small + defensible in V1)
 TRUSTED_DOMAINS = {
@@ -151,28 +151,33 @@ def build_search_query(title: str) -> str:
     if not title:
         return ""
 
-    # remove punctuation & collapse whitespace
     cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", title)
     words = [w.lower() for w in cleaned.split() if len(w) >= 4]
 
-    # remove ultra-common stop words (tiny list)
     stop = {"this", "that", "with", "from", "will", "have", "your", "what", "when", "where", "said", "says"}
     words = [w for w in words if w not in stop]
 
-    # keep first 6-8 keywords
     return " ".join(words[:8])
 
 
-async def trusted_corroboration(query: str) -> dict:
+def _is_same_or_subdomain(candidate: str, base: str) -> bool:
+    # candidate == base OR candidate is a subdomain of base
+    return candidate == base or candidate.endswith("." + base)
+
+
+async def trusted_corroboration(query: str, exclude_domain: str | None) -> dict:
     """
-    Uses DuckDuckGo HTML search (demo-level) and counts unique trusted domains present in results.
+    Uses DuckDuckGo HTML search (demo-level) and counts unique trusted domains present in results,
+    excluding the scanned domain (and its subdomains) so corroboration means "other outlets".
     Returns: {"hits": int, "domains": [..]}
     """
     if not query:
         return {"hits": 0, "domains": []}
 
-    # cache for 12 hours
-    cached = CORRO_CACHE.get(query)
+    # Cache key includes exclude_domain to avoid mixing results
+    cache_key = f"{query}||exclude={exclude_domain or ''}"
+
+    cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
         if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 12 * 3600:
@@ -196,26 +201,32 @@ async def trusted_corroboration(query: str) -> dict:
         return {"hits": 0, "domains": []}
 
     soup = BeautifulSoup(html, "html.parser")
-
-    # DDG HTML results typically have links with class "result__a"
     links = soup.select("a.result__a")
+
     found = set()
+    exclude = (exclude_domain or "").lower().strip()
 
     for a in links[:15]:
         href = a.get("href") or ""
-        # Some hrefs are redirect links; still usually include the real URL
         dom = parse_domain(href)
         if not dom:
             continue
 
-        # Match allowlist by suffix: e.g. "bbc.co.uk" should match dom "bbc.co.uk"
+        dom = dom.lower()
+
+        # Exclude the scanned domain & its subdomains
+        if exclude and _is_same_or_subdomain(dom, exclude):
+            continue
+
+        # Match allowlist
         for trusted in TRUSTED_DOMAINS:
-            if dom == trusted or dom.endswith("." + trusted) or trusted.endswith("." + dom):
+            t = trusted.lower()
+            if dom == t or dom.endswith("." + t) or t.endswith("." + dom):
                 found.add(trusted)
                 break
 
     result = {"hits": len(found), "domains": sorted(found)}
-    CORRO_CACHE[query] = {"hits": result["hits"], "domains": result["domains"], "fetched_at": datetime.now(timezone.utc)}
+    CORRO_CACHE[cache_key] = {"hits": result["hits"], "domains": result["domains"], "fetched_at": datetime.now(timezone.utc)}
     return result
 
 
@@ -269,9 +280,9 @@ async def fetch_extract(url: str) -> dict:
     domain = parse_domain(final_url)
     domain_age_days = await rdap_domain_age_days(domain) if domain else None
 
-    # Corroboration (trusted domains)
+    # Corroboration (trusted domains), excluding the scanned domain
     query = build_search_query(title)
-    corro = await trusted_corroboration(query)
+    corro = await trusted_corroboration(query, exclude_domain=domain)
     corroboration_hits = corro.get("hits", 0)
     corroboration_domains = corro.get("domains", [])
 
@@ -303,14 +314,12 @@ def score_link(signals: dict) -> dict:
 
     source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
 
-    # Cross verification uses trusted corroboration hits
     hits = signals.get("corroboration_hits")
     if hits is None:
         cross_verify = 50
     else:
         cross_verify = clamp(int(min(100, hits * 25)))  # 0->0,1->25,2->50,3->75,4+->100
 
-    # Not implemented yet in this demo
     ai_manip = 50
     context = 60 if signals.get("title") else 40
 
@@ -327,7 +336,6 @@ def score_link(signals: dict) -> dict:
     if signals.get("blocked"):
         badges.append("SITE_BLOCKED_AUTOMATION")
 
-    # Add a lightweight badge if corroboration is strong
     if isinstance(hits, int) and hits >= 3:
         badges.append("MULTI_SOURCE_CORROBORATION")
     elif isinstance(hits, int) and hits == 0:
@@ -342,7 +350,7 @@ def score_link(signals: dict) -> dict:
         if isinstance(hits, int):
             summary = (
                 f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-                f"Trusted-source corroboration found: {hits} domain(s)."
+                f"Trusted-source corroboration found: {hits} other trusted domain(s)."
             )
         else:
             summary = (
@@ -381,7 +389,6 @@ def analyze_image(image_path: str) -> dict:
         signals["width"], signals["height"] = img.size
         signals["phash"] = str(imagehash.phash(img))
 
-    # EXIF best-effort
     try:
         exif_dict = piexif.load(image_path)
         signals["exif_present"] = True if exif_dict and any(exif_dict.values()) else False
@@ -399,10 +406,9 @@ def analyze_image(image_path: str) -> dict:
 
 
 def score_image(signals: dict) -> dict:
-    # Neutral for pillars we haven't implemented for pure image scans
     source = 50
     cross_verify = 50
-    ai_manip = 50  # no model yet
+    ai_manip = 50
 
     context = 65 if signals.get("exif_present") else 50
     if signals.get("exif_software"):
@@ -477,7 +483,6 @@ async def create_link_scan(payload: dict):
     scan_id = str(uuid.uuid4())
     SCANS[scan_id] = {"status": "queued"}
 
-    # Run in background so POST returns immediately (works better on Render)
     asyncio.create_task(run_link_scan(scan_id, url))
 
     return {"scan_id": scan_id, "status": "queued"}
@@ -504,7 +509,6 @@ async def create_image_scan(image: UploadFile = File(...)):
 
     path.write_bytes(data)
 
-    # Run in background so POST returns immediately
     asyncio.create_task(run_image_scan(scan_id, str(path)))
 
     return {"scan_id": scan_id, "status": "queued"}
