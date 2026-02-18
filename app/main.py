@@ -34,12 +34,7 @@ INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
 
-APP_VERSION = "explain-v1-2026-02-17"
-
-@app.get("/version")
-def version():
-    return {"version": APP_VERSION}
-
+APP_VERSION = "veriscan-corroboration-v2-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -295,29 +290,115 @@ async def rdap_domain_age_days(domain: str) -> int | None:
 
 
 def build_search_query(title: str) -> str:
+    """
+    Build a sturdy keyword query from the page title.
+    Keeps it short, removes punctuation, drops weak stopwords.
+    """
     if not title:
         return ""
     cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", title)
-    words = [w.lower() for w in cleaned.split() if len(w) >= 4]
-    stop = {"this", "that", "with", "from", "will", "have", "your", "what", "when", "where", "said", "says"}
-    words = [w for w in words if w not in stop]
-    return " ".join(words[:8])
+    words = [w.strip() for w in cleaned.split() if w.strip()]
+    stop = {
+        "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
+        "this","that","these","those","it","its","as","is","are","was","were","be","been",
+        "what","when","where","who","why","how","says","said","report","reports","live","update"
+    }
+    kept = []
+    for w in words:
+        wl = w.lower()
+        if wl in stop:
+            continue
+        if len(w) >= 3 or w.isdigit():
+            kept.append(wl)
+
+    return " ".join(kept[:10])
+
+
+def extract_entityish_terms(title: str) -> list[str]:
+    """
+    Very light heuristic for entity-like tokens without NLP libs.
+    Captures CapitalizedWords, ALLCAPS, etc.
+    """
+    if not title:
+        return []
+
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-’']+", title)
+
+    stop_caps = {
+        "The","A","An","And","Or","But","To","Of","In","On","For","With","From","By","At",
+        "This","That","These","Those","It","Its","As","Is","Are","Was","Were","Be","Been",
+        "Breaking","Live","Update","Opinion","Analysis"
+    }
+
+    picks = []
+    for t in tokens:
+        if t in stop_caps:
+            continue
+        if (t.isupper() and len(t) >= 2) or (t[0].isupper() and len(t) >= 3):
+            picks.append(t)
+
+    seen = set()
+    out = []
+    for p in picks:
+        pl = p.lower()
+        if pl not in seen:
+            seen.add(pl)
+            out.append(p)
+    return out[:6]
+
+
+def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
+    """
+    Build multiple queries to reduce false '0 corroboration' results.
+    """
+    q1 = build_search_query(title)
+
+    ents = extract_entityish_terms(title)
+    q2 = " ".join([e.lower() for e in ents[:5]]) if ents else ""
+
+    base_dom = (domain or "").split(".")[0].lower().strip()
+    q3 = ""
+    if base_dom and q2:
+        q3 = f"{base_dom} {q2}"
+    elif base_dom and q1:
+        q3 = f"{base_dom} {q1}"
+
+    qs = []
+    seen = set()
+    for q in [q1, q2, q3]:
+        q = (q or "").strip()
+        if not q:
+            continue
+        if q in seen:
+            continue
+        seen.add(q)
+        qs.append(q)
+
+    return qs
 
 
 def _is_same_or_subdomain(candidate: str, base: str) -> bool:
     return candidate == base or candidate.endswith("." + base)
 
 
-async def trusted_corroboration(query: str, exclude_domain: str | None) -> dict:
-    if not query:
-        return {"hits": 0, "domains": []}
+async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
+    """
+    Runs multiple lightweight search queries and unions trusted-domain hits.
+    """
+    queries = [q.strip() for q in (queries or []) if q and q.strip()]
+    if not queries:
+        return {"hits": 0, "domains": [], "queries_used": []}
 
-    cache_key = f"{query}||exclude={exclude_domain or ''}"
+    cache_key = "||".join(queries) + f"||exclude={exclude_domain or ''}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
         if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 12 * 3600:
-            return {"hits": cached.get("hits", 0), "domains": cached.get("domains", [])}
+            return {
+                "hits": cached.get("hits", 0),
+                "domains": cached.get("domains", []),
+                "queries_used": cached.get("queries_used", queries),
+            }
 
     url = "https://duckduckgo.com/html/"
     headers = {
@@ -327,39 +408,43 @@ async def trusted_corroboration(query: str, exclude_domain: str | None) -> dict:
         "Referer": "https://duckduckgo.com/",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
-            r = await client.get(url, params={"q": query})
-            if r.status_code != 200:
-                return {"hits": 0, "domains": []}
-            html = r.text
-    except Exception:
-        return {"hits": 0, "domains": []}
-
-    soup = BeautifulSoup(html, "html.parser")
-    links = soup.select("a.result__a")
-
-    found = set()
     exclude = (exclude_domain or "").lower().strip()
+    found = set()
 
-    for a in links[:15]:
-        href = a.get("href") or ""
-        dom = parse_domain(href)
-        if not dom:
-            continue
-        dom = dom.lower()
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+        for q in queries[:3]:  # keep it cheap
+            try:
+                r = await client.get(url, params={"q": q})
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                links = soup.select("a.result__a")
+            except Exception:
+                continue
 
-        if exclude and _is_same_or_subdomain(dom, exclude):
-            continue
+            for a in links[:12]:
+                href = a.get("href") or ""
+                dom = parse_domain(href)
+                if not dom:
+                    continue
+                dom = dom.lower()
 
-        for trusted in TRUSTED_DOMAINS:
-            t = trusted.lower()
-            if dom == t or dom.endswith("." + t) or t.endswith("." + dom):
-                found.add(trusted)
-                break
+                if exclude and _is_same_or_subdomain(dom, exclude):
+                    continue
 
-    result = {"hits": len(found), "domains": sorted(found)}
-    CORRO_CACHE[cache_key] = {"hits": result["hits"], "domains": result["domains"], "fetched_at": datetime.now(timezone.utc)}
+                for trusted in TRUSTED_DOMAINS:
+                    t = trusted.lower()
+                    if dom == t or dom.endswith("." + t) or t.endswith("." + dom):
+                        found.add(trusted)
+                        break
+
+    result = {"hits": len(found), "domains": sorted(found), "queries_used": queries[:3]}
+    CORRO_CACHE[cache_key] = {
+        "hits": result["hits"],
+        "domains": result["domains"],
+        "queries_used": result["queries_used"],
+        "fetched_at": datetime.now(timezone.utc),
+    }
     return result
 
 
@@ -390,7 +475,7 @@ async def fetch_extract(url: str) -> dict:
                 "blocked": True,
                 "corroboration_hits": None,
                 "corroboration_domains": [],
-                "corroboration_query": "",
+                "corroboration_queries": [],
             }
 
         r.raise_for_status()
@@ -411,8 +496,8 @@ async def fetch_extract(url: str) -> dict:
     domain = parse_domain(final_url)
     domain_age_days = await rdap_domain_age_days(domain) if domain else None
 
-    query = build_search_query(title)
-    corro = await trusted_corroboration(query, exclude_domain=domain)
+    queries = build_corroboration_queries(title, domain)
+    corro = await trusted_corroboration(queries, exclude_domain=domain)
 
     return {
         "final_url": final_url,
@@ -425,7 +510,7 @@ async def fetch_extract(url: str) -> dict:
         "blocked": False,
         "corroboration_hits": corro.get("hits", 0),
         "corroboration_domains": corro.get("domains", []),
-        "corroboration_query": query,
+        "corroboration_queries": corro.get("queries_used", []),
     }
 
 
@@ -566,7 +651,7 @@ def score_image(signals: dict) -> dict:
 
 
 # -------------------------
-# ✅ Explain this score
+# Explain
 # -------------------------
 
 def build_explanation(report: dict) -> dict:
@@ -677,7 +762,7 @@ async def run_link_scan(scan_id: str, url: str):
         db_upsert_scan(scan_id, "running")
         signals = await fetch_extract(url)
         report = score_link(signals)
-        report["explain"] = build_explanation(report)   # ✅ store explain for new scans
+        report["explain"] = build_explanation(report)   # store explain for new scans
         db_upsert_scan(scan_id, "complete", report=report)
     except Exception as e:
         db_upsert_scan(scan_id, "error", error=str(e))
@@ -688,7 +773,7 @@ async def run_image_scan(scan_id: str, path_str: str):
         db_upsert_scan(scan_id, "running")
         signals = analyze_image(path_str)
         report = score_image(signals)
-        report["explain"] = build_explanation(report)   # ✅ store explain for new scans
+        report["explain"] = build_explanation(report)   # store explain for new scans
         db_upsert_scan(scan_id, "complete", report=report)
     except Exception as e:
         db_upsert_scan(scan_id, "error", error=str(e))
@@ -701,6 +786,11 @@ async def run_image_scan(scan_id: str, path_str: str):
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     return "ok"
+
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -746,7 +836,7 @@ async def create_image_scan(image: UploadFile = File(...)):
     return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
 
 
-# ✅✅✅ PATCHED ENDPOINT: ALWAYS returns report.explain (even for old scans)
+# Always returns report.explain for complete scans (even older ones)
 @app.get("/api/v1/scan/{scan_id}")
 def get_scan(scan_id: str):
     item = db_get_scan(scan_id)
@@ -758,19 +848,17 @@ def get_scan(scan_id: str):
     if item["status"] == "complete":
         report = item.get("report") or {}
 
-        # ---- PATCH: compute explain if missing ----
-        try:
-            if not report.get("explain"):
+        if not report.get("explain"):
+            try:
                 report["explain"] = build_explanation(report)
                 db_upsert_scan(scan_id, "complete", report=report)
-        except Exception:
-            report["explain"] = {
-                "highlights": [],
-                "concerns": [],
-                "missing": ["Explanation engine failed unexpectedly."],
-                "guidance": "Try rerunning the scan."
-            }
-        # -----------------------------------------
+            except Exception:
+                report["explain"] = {
+                    "highlights": [],
+                    "concerns": [],
+                    "missing": ["Explanation engine failed unexpectedly."],
+                    "guidance": "Try rerunning the scan."
+                }
 
         resp["report"] = report
 
@@ -781,7 +869,7 @@ def get_scan(scan_id: str):
 
 
 # -------------------------
-# OG Image (unchanged)
+# OG Image
 # -------------------------
 
 def _html_escape(s: str) -> str:
@@ -919,9 +1007,8 @@ def og_image(scan_id: str):
 
 
 # -------------------------
-# Share page (includes Explain UI)
+# Share page (brace-safe HTML)
 # -------------------------
-
 
 @app.get("/result/{scan_id}", response_class=HTMLResponse)
 def result_page(scan_id: str, request: Request):
@@ -975,47 +1062,47 @@ body {
   border-radius:16px;
   max-width:900px;
   margin:auto;
+  border:1px solid rgba(255,255,255,.12);
 }
-.score {
-  font-size:42px;
-  font-weight:bold;
-}
-.band {
-  font-size:18px;
-  opacity:.8;
-}
-.section {
-  margin-top:24px;
-}
-ul {
-  margin-top:8px;
-}
-.muted {
-  opacity:.7;
-}
+.muted { opacity:.75; }
+.score { font-size:42px; font-weight:800; margin-top:10px; }
+.band { font-size:18px; opacity:.8; }
+.section { margin-top:22px; padding-top:14px; border-top:1px solid rgba(255,255,255,.12); }
+ul { margin-top:8px; }
 button {
-  padding:8px 14px;
-  border-radius:8px;
-  border:none;
+  padding:10px 14px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,.14);
+  background:rgba(255,255,255,.08);
+  color:#eaf0ff;
   cursor:pointer;
 }
+button:hover { background:rgba(255,255,255,.12); }
+code { background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; }
 </style>
 </head>
 <body>
 
 <div class="card">
-<h1>VeriScan Report</h1>
-<div class="muted">Scan ID: __SCAN_ID__</div>
+  <h1 style="margin:0;">VeriScan Report</h1>
+  <div class="muted">Scan ID: <code>__SCAN_ID__</code></div>
 
-<div id="content">Loading...</div>
+  <div id="content" style="margin-top:16px;">Loading...</div>
 
-<div style="margin-top:20px;">
-<button onclick="copyLink()">Copy Link</button>
-</div>
+  <div style="margin-top:20px;">
+    <button onclick="copyLink()">Copy Link</button>
+  </div>
 </div>
 
 <script>
 const scanId = __SCAN_ID_JSON__;
+
+function esc(s){
+  return String(s || "")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;");
+}
 
 function copyLink() {
   navigator.clipboard.writeText(window.location.href);
@@ -1026,41 +1113,58 @@ async function load() {
   const data = await res.json();
 
   if (data.status !== "complete") {
-    document.getElementById("content").innerHTML = "<div>Status: " + data.status + "</div>";
+    document.getElementById("content").innerHTML =
+      "<div><b>Status:</b> " + esc(data.status) + "</div>";
     return;
   }
 
-  const r = data.report;
+  const r = data.report || {};
+  const sig = (r.evidence && r.evidence.signals) ? r.evidence.signals : {};
 
   let explainHTML = "";
   if (r.explain) {
+    const h = r.explain.highlights || [];
+    const c = r.explain.concerns || [];
+    const m = r.explain.missing || [];
+    const g = r.explain.guidance || "";
+
+    const list = (arr) => arr.length ? "<ul>" + arr.map(x => "<li>"+esc(x)+"</li>").join("") + "</ul>"
+                                    : "<div class='muted'>None</div>";
+
     explainHTML = `
       <div class="section">
-        <h3>Explain This Score</h3>
-
-        <b>What helped:</b>
-        <ul>${(r.explain.highlights || []).map(x => "<li>"+x+"</li>").join("")}</ul>
-
-        <b>What raised concern:</b>
-        <ul>${(r.explain.concerns || []).map(x => "<li>"+x+"</li>").join("")}</ul>
-
-        <b>What we couldn’t verify:</b>
-        <ul>${(r.explain.missing || []).map(x => "<li>"+x+"</li>").join("")}</ul>
-
-        <div class="muted" style="margin-top:8px;">
-          ${r.explain.guidance || ""}
-        </div>
+        <h3 style="margin:0 0 8px;">Explain This Score</h3>
+        <b>What helped</b>
+        ${list(h)}
+        <b>What raised concern</b>
+        ${list(c)}
+        <b>What we couldn’t verify</b>
+        ${list(m)}
+        <div class="muted" style="margin-top:10px;">${esc(g)}</div>
       </div>
     `;
   }
 
+  // Show corroboration queries used (so you can see the new B logic working)
+  const qs = sig.corroboration_queries || [];
+  const qLine = qs.length ? qs.map(esc).join(" • ") : "—";
+
   document.getElementById("content").innerHTML = `
     <div class="score">${r.overall_score}/100</div>
-    <div class="band">${r.band_label}</div>
+    <div class="band">${esc(r.band_label)}</div>
 
     <div class="section">
       <b>Summary:</b>
-      <div>${r.summary_text}</div>
+      <div style="margin-top:6px;">${esc(r.summary_text)}</div>
+    </div>
+
+    <div class="section">
+      <b>Trusted corroboration:</b>
+      <div style="margin-top:6px;">
+        Hits: <code>${esc(String(sig.corroboration_hits ?? "—"))}</code>
+        &nbsp; Domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
+      </div>
+      <div class="muted" style="margin-top:8px;">Queries used: <code>${qLine}</code></div>
     </div>
 
     ${explainHTML}
@@ -1086,4 +1190,3 @@ load();
     )
 
     return HTMLResponse(html)
-
