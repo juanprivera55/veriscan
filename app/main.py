@@ -28,13 +28,12 @@ except Exception:
     RealDictCursor = None
 
 
-BASE_DIR = Path(__file__).resolve().parent          # .../veriscan/app
-STATIC_DIR = BASE_DIR / "static"                    # .../veriscan/app/static
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-
-APP_VERSION = "veriscan-corroboration-v2-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v3-claimquery-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -289,47 +288,45 @@ async def rdap_domain_age_days(domain: str) -> int | None:
     return age_days
 
 
-def build_search_query(title: str) -> str:
-    """
-    Build a sturdy keyword query from the page title.
-    Keeps it short, removes punctuation, drops weak stopwords.
-    """
-    if not title:
-        return ""
-    cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", title)
-    words = [w.strip() for w in cleaned.split() if w.strip()]
-    stop = {
-        "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
-        "this","that","these","those","it","its","as","is","are","was","were","be","been",
-        "what","when","where","who","why","how","says","said","report","reports","live","update"
-    }
-    kept = []
-    for w in words:
-        wl = w.lower()
-        if wl in stop:
-            continue
-        if len(w) >= 3 or w.isdigit():
-            kept.append(wl)
+def _is_same_or_subdomain(candidate: str, base: str) -> bool:
+    return candidate == base or candidate.endswith("." + base)
 
-    return " ".join(kept[:10])
+
+def strip_publisher_terms(title: str, domain: str | None) -> str:
+    """
+    Remove publisher suffix (': NPR') and base domain token (npr, reuters, etc.)
+    so we search the claim, not the publisher.
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+
+    # Strip trailing " : NPR" or "| NPR" style endings
+    t = re.sub(r"\s*[:\|\-]\s*[A-Za-z0-9\.]{2,}\s*$", "", t).strip()
+
+    base = (domain or "").split(".")[0].lower().strip()
+    if base:
+        t = re.sub(rf"\b{re.escape(base)}\b", "", t, flags=re.IGNORECASE).strip()
+
+    t = re.sub(r"\bnpr\b", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def extract_entityish_terms(title: str) -> list[str]:
     """
-    Very light heuristic for entity-like tokens without NLP libs.
-    Captures CapitalizedWords, ALLCAPS, etc.
+    Lightweight entity-like detection:
+    - TitleCase words (Jesse, Jackson)
+    - ALLCAPS (SEC, FBI)
     """
     if not title:
         return []
-
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-’']+", title)
-
     stop_caps = {
         "The","A","An","And","Or","But","To","Of","In","On","For","With","From","By","At",
         "This","That","These","Those","It","Its","As","Is","Are","Was","Were","Be","Been",
-        "Breaking","Live","Update","Opinion","Analysis"
+        "Breaking","Live","Update","Opinion","Analysis","Longtime"
     }
-
     picks = []
     for t in tokens:
         if t in stop_caps:
@@ -347,21 +344,113 @@ def extract_entityish_terms(title: str) -> list[str]:
     return out[:6]
 
 
+def build_search_query(text: str) -> str:
+    """
+    Generic keyword query builder from text.
+    """
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", text)
+    words = [w.strip() for w in cleaned.split() if w.strip()]
+    stop = {
+        "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
+        "this","that","these","those","it","its","as","is","are","was","were","be","been",
+        "what","when","where","who","why","how","says","said","report","reports","live","update"
+    }
+    kept = []
+    for w in words:
+        wl = w.lower()
+        if wl in stop:
+            continue
+        if len(w) >= 3 or w.isdigit():
+            kept.append(wl)
+    return " ".join(kept[:10])
+
+
+def build_claim_query(title: str, domain: str | None) -> str:
+    """
+    Claim-focused query: entity + action + key numbers (+ a couple strong extras)
+    """
+    clean = strip_publisher_terms(title, domain)
+    if not clean:
+        return ""
+
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-’']+|\d+", clean)
+
+    action_words = {
+        "dies","dead","killed","killing","murder","arrested","charged","sentenced",
+        "wins","won","loses","lost","lawsuit","sued","sues","indicted","resigns","steps",
+        "announces","launches","files","bans","ban","approves","rejects","fires","fired",
+        "hospitalized","missing","found","confirms","denies"
+    }
+
+    stop = {
+        "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
+        "this","that","these","those","it","its","as","is","are","was","were","be","been",
+        "longtime","latest","update","live","exclusive","report","reports","analysis","opinion",
+        "leader","leaders"
+    }
+
+    entities = extract_entityish_terms(clean)
+    ent_part = [e.lower() for e in entities[:2]]
+
+    action_part = []
+    for t in tokens:
+        tl = t.lower()
+        if tl in action_words:
+            action_part = [tl]
+            break
+
+    nums = [t for t in tokens if t.isdigit()]
+    num_part = nums[:2]
+
+    extras = []
+    for t in tokens:
+        tl = t.lower()
+        if tl in stop:
+            continue
+        if tl in ent_part:
+            continue
+        if tl in action_part:
+            continue
+        if t.isdigit():
+            continue
+        if len(tl) >= 5:
+            extras.append(tl)
+        if len(extras) >= 3:
+            break
+
+    parts = []
+    parts += ent_part
+    parts += action_part
+    parts += num_part
+    parts += extras
+
+    seen = set()
+    out = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+
+    return " ".join(out[:8]).strip()
+
+
 def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
     """
-    Build multiple queries to reduce false '0 corroboration' results.
+    Q1: claim-focused
+    Q2: entity-only
+    Q3: publisher+claim fallback (kept but not dominant)
     """
-    q1 = build_search_query(title)
+    clean_title = strip_publisher_terms(title, domain)
+    q1 = build_claim_query(title, domain)
 
-    ents = extract_entityish_terms(title)
-    q2 = " ".join([e.lower() for e in ents[:5]]) if ents else ""
+    ents = extract_entityish_terms(clean_title)
+    q2 = " ".join([e.lower() for e in ents[:4]]) if ents else ""
 
     base_dom = (domain or "").split(".")[0].lower().strip()
-    q3 = ""
-    if base_dom and q2:
-        q3 = f"{base_dom} {q2}"
-    elif base_dom and q1:
-        q3 = f"{base_dom} {q1}"
+    q3 = f"{base_dom} {q1}".strip() if base_dom and q1 else ""
 
     qs = []
     seen = set()
@@ -373,23 +462,22 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
             continue
         seen.add(q)
         qs.append(q)
-
     return qs
-
-
-def _is_same_or_subdomain(candidate: str, base: str) -> bool:
-    return candidate == base or candidate.endswith("." + base)
 
 
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
     """
-    Runs multiple lightweight search queries and unions trusted-domain hits.
+    Reliable corroboration: for each priority trusted domain,
+    search `site:trusted <claim_query>` and count hits.
     """
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
         return {"hits": 0, "domains": [], "queries_used": []}
 
-    cache_key = "||".join(queries) + f"||exclude={exclude_domain or ''}"
+    claim_query = queries[0]
+    exclude = (exclude_domain or "").lower().strip()
+
+    cache_key = f"sitecheck::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -397,10 +485,10 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             return {
                 "hits": cached.get("hits", 0),
                 "domains": cached.get("domains", []),
-                "queries_used": cached.get("queries_used", queries),
+                "queries_used": cached.get("queries_used", [claim_query]),
             }
 
-    url = "https://duckduckgo.com/html/"
+    ddg_url = "https://duckduckgo.com/html/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -408,13 +496,24 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
         "Referer": "https://duckduckgo.com/",
     }
 
-    exclude = (exclude_domain or "").lower().strip()
     found = set()
 
+    priority = [
+        "apnews.com", "reuters.com", "bbc.com", "cnn.com",
+        "nytimes.com", "washingtonpost.com", "theguardian.com",
+        "usatoday.com", "nbcnews.com", "abcnews.go.com",
+        "bloomberg.com", "cnbc.com"
+    ]
+    priority = [d for d in priority if d in TRUSTED_DOMAINS]
+
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
-        for q in queries[:3]:  # keep it cheap
+        for td in priority:
+            if exclude and _is_same_or_subdomain(td, exclude):
+                continue
+
+            q = f"site:{td} {claim_query}"
             try:
-                r = await client.get(url, params={"q": q})
+                r = await client.get(ddg_url, params={"q": q})
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -422,23 +521,24 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             except Exception:
                 continue
 
-            for a in links[:12]:
+            hit = False
+            for a in links[:8]:
                 href = a.get("href") or ""
                 dom = parse_domain(href)
                 if not dom:
                     continue
                 dom = dom.lower()
+                if dom == td or dom.endswith("." + td):
+                    hit = True
+                    break
 
-                if exclude and _is_same_or_subdomain(dom, exclude):
-                    continue
+            if hit:
+                found.add(td)
 
-                for trusted in TRUSTED_DOMAINS:
-                    t = trusted.lower()
-                    if dom == t or dom.endswith("." + t) or t.endswith("." + dom):
-                        found.add(trusted)
-                        break
+            if len(found) >= 4:
+                break
 
-    result = {"hits": len(found), "domains": sorted(found), "queries_used": queries[:3]}
+    result = {"hits": len(found), "domains": sorted(found), "queries_used": [claim_query]}
     CORRO_CACHE[cache_key] = {
         "hits": result["hits"],
         "domains": result["domains"],
@@ -762,7 +862,7 @@ async def run_link_scan(scan_id: str, url: str):
         db_upsert_scan(scan_id, "running")
         signals = await fetch_extract(url)
         report = score_link(signals)
-        report["explain"] = build_explanation(report)   # store explain for new scans
+        report["explain"] = build_explanation(report)
         db_upsert_scan(scan_id, "complete", report=report)
     except Exception as e:
         db_upsert_scan(scan_id, "error", error=str(e))
@@ -773,7 +873,7 @@ async def run_image_scan(scan_id: str, path_str: str):
         db_upsert_scan(scan_id, "running")
         signals = analyze_image(path_str)
         report = score_image(signals)
-        report["explain"] = build_explanation(report)   # store explain for new scans
+        report["explain"] = build_explanation(report)
         db_upsert_scan(scan_id, "complete", report=report)
     except Exception as e:
         db_upsert_scan(scan_id, "error", error=str(e))
@@ -836,7 +936,6 @@ async def create_image_scan(image: UploadFile = File(...)):
     return {"scan_id": scan_id, "status": "queued", "share_url": f"/result/{scan_id}"}
 
 
-# Always returns report.explain for complete scans (even older ones)
 @app.get("/api/v1/scan/{scan_id}")
 def get_scan(scan_id: str):
     item = db_get_scan(scan_id)
@@ -847,7 +946,6 @@ def get_scan(scan_id: str):
 
     if item["status"] == "complete":
         report = item.get("report") or {}
-
         if not report.get("explain"):
             try:
                 report["explain"] = build_explanation(report)
@@ -859,7 +957,6 @@ def get_scan(scan_id: str):
                     "missing": ["Explanation engine failed unexpectedly."],
                     "guidance": "Try rerunning the scan."
                 }
-
         resp["report"] = report
 
     if item.get("error"):
@@ -869,7 +966,7 @@ def get_scan(scan_id: str):
 
 
 # -------------------------
-# OG Image
+# OG Image (unchanged)
 # -------------------------
 
 def _html_escape(s: str) -> str:
@@ -1039,7 +1136,6 @@ def result_page(scan_id: str, request: Request):
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-
 <title>__OG_TITLE__</title>
 
 <meta property="og:title" content="__OG_TITLE__" />
@@ -1049,34 +1145,14 @@ def result_page(scan_id: str, request: Request):
 <meta property="og:image" content="__OG_IMG__" />
 
 <style>
-body {
-  font-family: Arial, sans-serif;
-  background:#0b1020;
-  color:#eaf0ff;
-  margin:0;
-  padding:40px;
-}
-.card {
-  background:#111933;
-  padding:24px;
-  border-radius:16px;
-  max-width:900px;
-  margin:auto;
-  border:1px solid rgba(255,255,255,.12);
-}
+body { font-family: Arial, sans-serif; background:#0b1020; color:#eaf0ff; margin:0; padding:40px; }
+.card { background:#111933; padding:24px; border-radius:16px; max-width:900px; margin:auto; border:1px solid rgba(255,255,255,.12); }
 .muted { opacity:.75; }
 .score { font-size:42px; font-weight:800; margin-top:10px; }
 .band { font-size:18px; opacity:.8; }
 .section { margin-top:22px; padding-top:14px; border-top:1px solid rgba(255,255,255,.12); }
 ul { margin-top:8px; }
-button {
-  padding:10px 14px;
-  border-radius:10px;
-  border:1px solid rgba(255,255,255,.14);
-  background:rgba(255,255,255,.08);
-  color:#eaf0ff;
-  cursor:pointer;
-}
+button { padding:10px 14px; border-radius:10px; border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.08); color:#eaf0ff; cursor:pointer; }
 button:hover { background:rgba(255,255,255,.12); }
 code { background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; }
 </style>
@@ -1145,7 +1221,6 @@ async function load() {
     `;
   }
 
-  // Show corroboration queries used (so you can see the new B logic working)
   const qs = sig.corroboration_queries || [];
   const qLine = qs.length ? qs.map(esc).join(" • ") : "—";
 
@@ -1164,7 +1239,7 @@ async function load() {
         Hits: <code>${esc(String(sig.corroboration_hits ?? "—"))}</code>
         &nbsp; Domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
       </div>
-      <div class="muted" style="margin-top:8px;">Queries used: <code>${qLine}</code></div>
+      <div class="muted" style="margin-top:8px;">Claim query used: <code>${qLine}</code></div>
     </div>
 
     ${explainHTML}
@@ -1190,3 +1265,4 @@ load();
     )
 
     return HTMLResponse(html)
+
