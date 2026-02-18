@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus
 from datetime import datetime, timezone
 import uuid
 import asyncio
@@ -9,6 +9,7 @@ import re
 import json
 import io
 import os
+import xml.etree.ElementTree as ET
 
 import httpx
 from bs4 import BeautifulSoup
@@ -33,7 +34,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v6-brave-search-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v7-bing-rss-alloutlets-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -47,7 +48,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = str((BASE_DIR / "veriscan.db").resolve())
 POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
 
 TRUSTED_DOMAINS = {
     "reuters.com",
@@ -469,128 +469,104 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 
 # -------------------------
-# Corroboration Engines
+# Corroboration: Bing News RSS (All Outlets)
 # -------------------------
 
-async def brave_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+def _parse_rss_links(xml_text: str) -> list[str]:
     """
-    Preferred: real web search via Brave Search API.
+    Extract <link> from RSS <item>. Returns list of URLs.
+    Handles namespaces safely.
     """
-    if not BRAVE_API_KEY:
-        return {"hits": None, "domains": [], "engine": "brave", "status_code": None, "error": "missing BRAVE_API_KEY"}
+    urls: list[str] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return urls
 
+    # RSS: channel/item/link
+    # Some feeds use namespaces; this approach ignores namespaces by checking endswith.
+    for item in root.iter():
+        if not item.tag.lower().endswith("item"):
+            continue
+        for child in list(item):
+            if child.tag.lower().endswith("link") and child.text:
+                u = child.text.strip()
+                if u:
+                    urls.append(u)
+                break
+    return urls
+
+
+async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+    """
+    Free corroboration: Bing News RSS.
+    Scans ALL outlets and counts:
+      - all_outlets_hits: number of unique outlet domains found
+      - trusted_hits: number of unique trusted domains found
+    """
     exclude = normalize_domain(exclude_domain or "")
-    found = set()
+    q = quote_plus(claim_query)
+    rss_url = f"https://www.bing.com/news/search?q={q}&format=rss"
 
-    url = "https://api.search.brave.com/res/v1/web/search"
     headers = {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": BRAVE_API_KEY,
-        "User-Agent": "VeriScan/0.1",
-    }
-    params = {
-        "q": claim_query,
-        "count": 30,
-        "country": "us",
-        "search_lang": "en",
-        # bias recent (past week) for breaking news; change to "pm"/"py" if you want broader
-        "freshness": "pw",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers, params=params)
-            if r.status_code != 200:
-                return {"hits": None, "domains": [], "engine": "brave", "status_code": r.status_code}
-            data = r.json()
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(rss_url)
+            status = r.status_code
+            if status != 200:
+                return {"ok": False, "engine": "bing_rss", "status_code": status, "rss_url": rss_url}
+            xml_text = r.text
     except Exception as e:
-        return {"hits": None, "domains": [], "engine": "brave", "status_code": None, "error": str(e)}
+        return {"ok": False, "engine": "bing_rss", "status_code": None, "error": str(e), "rss_url": rss_url}
 
-    results = (((data or {}).get("web") or {}).get("results") or [])
-    for item in results:
-        u = (item or {}).get("url") or ""
+    links = _parse_rss_links(xml_text)
+    all_domains: list[str] = []
+    for u in links:
         dom = normalize_domain(parse_domain(u) or "")
         if not dom:
             continue
-
         if exclude and (dom == exclude or dom.endswith("." + exclude)):
             continue
+        all_domains.append(dom)
 
+    # unique outlets, preserve rough order
+    seen = set()
+    uniq_domains = []
+    for d in all_domains:
+        if d not in seen:
+            seen.add(d)
+            uniq_domains.append(d)
+
+    trusted_found = set()
+    for dom in uniq_domains:
         for td in TRUSTED_DOMAINS:
             tdn = normalize_domain(td)
             if dom == tdn or dom.endswith("." + tdn):
-                found.add(td)
+                trusted_found.add(td)
                 break
 
-        if len(found) >= 10:
-            break
-
-    return {"hits": len(found), "domains": sorted(found), "engine": "brave", "status_code": 200}
-
-
-async def ddg_site_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
-    """
-    Backup only (scraping DDG is flaky on cloud servers).
-    Kept as a no-key fallback so demo doesn't "break" if BRAVE_API_KEY missing.
-    """
-    exclude = normalize_domain(exclude_domain or "")
-    found = set()
-    debug = {"ddg_statuses": {}}
-
-    ddg_url = "https://duckduckgo.com/html/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://duckduckgo.com/",
+    return {
+        "ok": True,
+        "engine": "bing_rss",
+        "status_code": 200,
+        "rss_url": rss_url,
+        "all_outlets_hits": len(uniq_domains),
+        "all_outlets_domains": uniq_domains,
+        "trusted_hits": len(trusted_found),
+        "trusted_domains": sorted(trusted_found),
     }
-
-    priority = [d for d in PRIORITY_TRUSTED if d in TRUSTED_DOMAINS]
-
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
-        for td in priority:
-            tdn = normalize_domain(td)
-            if exclude and (tdn == exclude or tdn.endswith("." + exclude)):
-                continue
-
-            q = f"site:{td} {claim_query}"
-            try:
-                r = await client.get(ddg_url, params={"q": q})
-                debug["ddg_statuses"][td] = r.status_code
-                if r.status_code != 200:
-                    continue
-                soup = BeautifulSoup(r.text, "html.parser")
-                links = soup.select("a.result__a")
-            except Exception:
-                continue
-
-            hit = False
-            for a in links[:10]:
-                href = a.get("href") or ""
-                real = unwrap_ddg_href(href)
-                dom = normalize_domain(parse_domain(real) or "")
-                if not dom:
-                    continue
-                if dom == tdn or dom.endswith("." + tdn):
-                    hit = True
-                    break
-
-            if hit:
-                found.add(td)
-
-            if len(found) >= 4:
-                break
-
-    # Note: if cloud bot mitigation happens, this will often return 0 with 202 statuses.
-    return {"hits": len(found), "domains": sorted(found), "engine": "ddg", "status_code": 200, "debug": debug}
 
 
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
     """
-    V6 corroboration:
-    - Use Brave Search API (real search results) if available
-    - Else fallback to DDG site: checks (demo-only)
+    V7 corroboration:
+    - Use Bing News RSS (free) to scan ALL outlets
+    - Score uses trusted_hits; debug includes all outlet domains
     """
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
@@ -599,11 +575,11 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v6::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
-        if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 6 * 3600:
+        if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 3 * 3600:
             return {
                 "hits": cached.get("hits"),
                 "domains": cached.get("domains", []),
@@ -612,43 +588,41 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 "debug": cached.get("debug", {}),
             }
 
-    # 1) Brave (best)
-    br = await brave_corroboration(claim_query, exclude_domain)
-    if br.get("hits") is not None:
-        result = {
-            "hits": br.get("hits"),
-            "domains": br.get("domains", []),
-            "queries_used": [claim_query],
-            "engine": br.get("engine", "brave"),
-            "debug": {"brave_status": br.get("status_code"), "brave_error": br.get("error")},
-        }
-        CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
-        return result
+    br = await bing_rss_corroboration(claim_query, exclude_domain)
 
-    # 2) DDG fallback (no-key demo fallback)
-    dd = await ddg_site_corroboration(claim_query, exclude_domain)
-    # If DDG returns 0 but also shows suspicious status codes (like 202), treat as unavailable, not "0"
-    debug = dd.get("debug", {})
-    ddg_statuses = (debug.get("ddg_statuses") or {}) if isinstance(debug, dict) else {}
-    suspicious = any(int(v) == 202 for v in ddg_statuses.values()) if ddg_statuses else False
-
-    if suspicious and dd.get("hits", 0) == 0:
+    if not br.get("ok"):
         result = {
             "hits": None,
             "domains": [],
             "queries_used": [claim_query],
-            "engine": "ddg",
-            "debug": {"ddg": debug, "note": "DDG returned bot/mitigation statuses; corroboration unavailable."},
+            "engine": "bing_rss",
+            "debug": {
+                "bing_status": br.get("status_code"),
+                "bing_error": br.get("error"),
+                "rss_url": br.get("rss_url"),
+                "note": "Bing RSS fetch failed; corroboration unavailable.",
+            },
         }
-    else:
-        result = {
-            "hits": dd.get("hits", 0),
-            "domains": dd.get("domains", []),
-            "queries_used": [claim_query],
-            "engine": dd.get("engine", "ddg"),
-            "debug": {"ddg": debug},
-        }
+        CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
+        return result
 
+    # Success
+    all_domains = br.get("all_outlets_domains", []) or []
+    # keep debug small
+    sample_all = all_domains[:20]
+
+    result = {
+        "hits": br.get("trusted_hits", 0),
+        "domains": br.get("trusted_domains", []) or [],
+        "queries_used": [claim_query],
+        "engine": "bing_rss",
+        "debug": {
+            "bing_status": br.get("status_code"),
+            "rss_url": br.get("rss_url"),
+            "all_outlets_hits": br.get("all_outlets_hits"),
+            "all_outlets_sample": sample_all,
+        },
+    }
     CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
     return result
 
@@ -780,7 +754,7 @@ def score_link(signals: dict) -> dict:
         if hits is None:
             summary = (
                 f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-                f"Trusted-source corroboration was unavailable for this scan (search provider blocked/failed)."
+                f"Trusted-source corroboration was unavailable for this scan."
             )
         else:
             summary = (
@@ -898,7 +872,7 @@ def build_explanation(report: dict) -> dict:
             concerns.append("No matches were found on the trusted corroboration list (not proof of falsehood, but less support).")
     else:
         if is_link:
-            missing_items.append("Trusted corroboration check was unavailable (search provider blocked/failed).")
+            missing_items.append("Trusted corroboration check was unavailable.")
 
     age_days = signals.get("domain_age_days")
     if age_days is None and is_link:
@@ -1143,7 +1117,6 @@ def og_image(scan_id: str):
     panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
     img.paste(panel, (card_x, card_y), panel)
 
-    # fixed typo (card_y + card_h)
     d.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
                         radius=26, outline=(255, 255, 255, 45), width=2)
 
@@ -1350,6 +1323,8 @@ async function load() {
 
   const engine = sig.corroboration_engine || "—";
   const debug = sig.corroboration_debug || {};
+  const allHits = debug.all_outlets_hits;
+  const allSample = debug.all_outlets_sample || [];
 
   document.getElementById("content").innerHTML = `
     <div class="score">${r.overall_score}/100</div>
@@ -1361,12 +1336,22 @@ async function load() {
     </div>
 
     <div class="section">
-      <b>Trusted corroboration:</b>
+      <b>Corroboration:</b>
       <div style="margin-top:6px;">
         Engine: <code>${esc(engine)}</code>
-        &nbsp; Hits: <code>${esc(String(sig.corroboration_hits ?? "unavailable"))}</code>
-        &nbsp; Domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
+        &nbsp; Trusted hits: <code>${esc(String(sig.corroboration_hits ?? "unavailable"))}</code>
+        &nbsp; Trusted domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
       </div>
+
+      <div class="muted" style="margin-top:10px;">
+        All outlets found (unique domains): <code>${esc(String(allHits ?? "—"))}</code>
+      </div>
+
+      ${allSample.length ? `
+        <div class="muted" style="margin-top:8px;">Sample outlets:</div>
+        <div style="margin-top:6px;"><code>${esc(allSample.join(", "))}</code></div>
+      ` : ""}
+
       <div class="muted" style="margin-top:8px;">Claim query used: <code>${qLine}</code></div>
 
       <details style="margin-top:10px;">
@@ -1398,4 +1383,3 @@ load();
     )
 
     return HTMLResponse(html)
-
