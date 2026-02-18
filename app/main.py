@@ -34,7 +34,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v7_1-bing-rss-unwrapped-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v7_2-bing-rss-links-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -78,13 +78,6 @@ TRUSTED_DOMAINS = {
     "fda.gov",
     "nih.gov",
 }
-
-PRIORITY_TRUSTED = [
-    "apnews.com", "reuters.com", "bbc.com", "cnn.com",
-    "nytimes.com", "washingtonpost.com", "theguardian.com",
-    "usatoday.com", "nbcnews.com", "abcnews.go.com",
-    "bloomberg.com", "cnbc.com", "aljazeera.com", "pbs.org", "propublica.org"
-]
 
 
 # -------------------------
@@ -311,14 +304,10 @@ def strip_publisher_terms(title: str, domain: str | None) -> str:
     t = (title or "").strip()
     if not t:
         return ""
-
-    # Remove trailing publisher markers like ": NPR" or "| CNN"
     t = re.sub(r"\s*[:\|\-]\s*[A-Za-z0-9\.]{2,}\s*$", "", t).strip()
-
     base = (domain or "").split(".")[0].lower().strip()
     if base:
         t = re.sub(rf"\b{re.escape(base)}\b", "", t, flags=re.IGNORECASE).strip()
-
     t = re.sub(r"\b(npr|reuters|ap|bbc|cnn)\b", "", t, flags=re.IGNORECASE).strip()
     t = re.sub(r"\s+", " ", t).strip()
     return t
@@ -354,11 +343,8 @@ def build_claim_query(title: str, domain: str | None) -> str:
     clean = strip_publisher_terms(title, domain)
     if not clean:
         return ""
-
-    # Remove honorifics that reduce matching
     clean = re.sub(r"\b(rev|reverend|mr|mrs|ms|dr)\.?\b", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\s+", " ", clean).strip()
-
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-’']+|\d+", clean)
 
     action_words = {
@@ -367,7 +353,6 @@ def build_claim_query(title: str, domain: str | None) -> str:
         "announces","launches","files","bans","ban","approves","rejects","fires","fired",
         "hospitalized","missing","found","confirms","denies"
     }
-
     stop = {
         "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
         "this","that","these","those","it","its","as","is","are","was","were","be","been",
@@ -423,11 +408,9 @@ def build_claim_query(title: str, domain: str | None) -> str:
 
 def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
     q1 = build_claim_query(title, domain)
-
     clean_title = strip_publisher_terms(title, domain)
     ents = extract_entityish_terms(clean_title)
     q2 = " ".join([e.lower() for e in ents[:4]]) if ents else ""
-
     base_dom = (domain or "").split(".")[0].lower().strip()
     q3 = f"{base_dom} {q1}".strip() if base_dom and q1 else ""
 
@@ -445,74 +428,34 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 
 # -------------------------
-# Corroboration: Bing News RSS (All Outlets) — V7.1
+# Corroboration: Bing News RSS with Evidence Links — V7.2
 # -------------------------
 
-def _parse_rss_links(xml_text: str) -> list[str]:
-    """
-    Extract <link> from RSS <item>. Returns list of URLs.
-    Handles namespaces safely.
-    """
-    urls: list[str] = []
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return urls
-
-    for item in root.iter():
-        if not item.tag.lower().endswith("item"):
-            continue
-        for child in list(item):
-            if child.tag.lower().endswith("link") and child.text:
-                u = child.text.strip()
-                if u:
-                    urls.append(u)
-                break
-    return urls
-
-
 def _unwrap_bing_news_link(u: str) -> str:
-    """
-    Bing News RSS links often look like:
-      https://www.bing.com/news/apiclick?url=ENCODED...
-      https://www.bing.com/news/redirect?url=ENCODED...
-    Pull out the real publisher URL when present.
-    """
     if not u:
         return ""
-
     try:
         p = urlparse(u)
     except Exception:
         return u
-
     host = (p.hostname or "").lower()
     if "bing.com" not in host:
         return u
-
     qs = parse_qs(p.query)
-
     for key in ("url", "u", "r", "RU"):
         if key in qs and qs[key]:
             return unquote(qs[key][0]).strip()
-
     return u
 
 
 async def _resolve_final_url(u: str) -> str:
-    """
-    Last resort: follow redirects to get the final publisher URL.
-    Uses HEAD first, then GET if needed.
-    """
     if not u:
         return ""
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
-
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
             try:
@@ -521,23 +464,54 @@ async def _resolve_final_url(u: str) -> str:
                     return str(r.url)
             except Exception:
                 pass
-
             r = await client.get(u)
             if r.status_code < 400:
                 return str(r.url)
     except Exception:
         return u
-
     return u
 
 
-async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+def _parse_rss_items(xml_text: str) -> list[dict]:
     """
-    Free corroboration: Bing News RSS.
-    Scans ALL outlets and counts:
-      - all_outlets_hits: unique outlet domains found (after unwrapping redirects)
-      - trusted_hits: unique trusted domains found
+    Returns list of items: {title, link}
     """
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return out
+
+    # Iterate items, ignore namespaces by checking tag suffix
+    for item in root.iter():
+        if not item.tag.lower().endswith("item"):
+            continue
+        title = ""
+        link = ""
+        for child in list(item):
+            tag = child.tag.lower()
+            if tag.endswith("title") and child.text and not title:
+                title = child.text.strip()
+            if tag.endswith("link") and child.text and not link:
+                link = child.text.strip()
+        if link:
+            out.append({"title": title[:220], "link": link})
+    return out
+
+
+def _is_trusted_domain(dom: str) -> str | None:
+    """
+    Returns the trusted domain matched (from TRUSTED_DOMAINS) or None.
+    """
+    d = normalize_domain(dom)
+    for td in TRUSTED_DOMAINS:
+        tdn = normalize_domain(td)
+        if d == tdn or d.endswith("." + tdn):
+            return td
+    return None
+
+
+async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: str | None) -> dict:
     exclude = normalize_domain(exclude_domain or "")
     q = quote_plus(claim_query)
     rss_url = f"https://www.bing.com/news/search?q={q}&format=rss"
@@ -551,87 +525,100 @@ async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -
     try:
         async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
             r = await client.get(rss_url)
-            status = r.status_code
-            if status != 200:
-                return {"ok": False, "engine": "bing_rss", "status_code": status, "rss_url": rss_url}
+            if r.status_code != 200:
+                return {"ok": False, "status_code": r.status_code, "rss_url": rss_url}
             xml_text = r.text
     except Exception as e:
-        return {"ok": False, "engine": "bing_rss", "status_code": None, "error": str(e), "rss_url": rss_url}
+        return {"ok": False, "status_code": None, "error": str(e), "rss_url": rss_url}
 
-    raw_links = _parse_rss_links(xml_text)
+    items = _parse_rss_items(xml_text)
 
-    # Unwrap Bing redirect params first
-    unwrapped = [_unwrap_bing_news_link(u) for u in raw_links if u]
+    # Unwrap links; resolve bing.com redirects (cap)
+    unwrapped = []
+    for it in items:
+        u = _unwrap_bing_news_link(it["link"])
+        unwrapped.append({"title": it.get("title", ""), "link": u})
 
-    # If still bing.com links remain, resolve redirects (cap to keep it fast)
+    # resolve remaining bing.com links
     N_RESOLVE = 12
-    to_resolve = []
-    keep = []
-    for u in unwrapped:
-        dom = normalize_domain(parse_domain(u) or "")
-        if dom == "bing.com" or dom.endswith(".bing.com"):
-            to_resolve.append(u)
-        else:
-            keep.append(u)
+    resolved_count = 0
+    for it in unwrapped:
+        dom = normalize_domain(parse_domain(it["link"]) or "")
+        if (dom == "bing.com" or dom.endswith(".bing.com")) and resolved_count < N_RESOLVE:
+            it["link"] = await _resolve_final_url(it["link"])
+            resolved_count += 1
 
-    resolved = []
-    for u in to_resolve[:N_RESOLVE]:
-        resolved.append(await _resolve_final_url(u))
+    # Build evidence lists
+    all_outlet_domains = []
+    evidence = []
+    trusted_domains_found = set()
 
-    all_links = keep + resolved
+    seen_links = set()
+    for it in unwrapped:
+        link = (it.get("link") or "").strip()
+        if not link or link in seen_links:
+            continue
+        seen_links.add(link)
 
-    all_domains: list[str] = []
-    for u in all_links:
-        dom = normalize_domain(parse_domain(u) or "")
+        dom = normalize_domain(parse_domain(link) or "")
         if not dom:
             continue
         if exclude and (dom == exclude or dom.endswith("." + exclude)):
             continue
-        all_domains.append(dom)
 
-    # unique outlets, preserve order
+        all_outlet_domains.append(dom)
+
+        trusted_match = _is_trusted_domain(dom)
+        if trusted_match:
+            trusted_domains_found.add(trusted_match)
+
+        evidence.append({
+            "title": (it.get("title") or "").strip()[:220],
+            "domain": dom,
+            "url": link,
+            "trusted": bool(trusted_match),
+        })
+
+    # unique outlets
     seen = set()
-    uniq_domains = []
-    for d in all_domains:
+    uniq_outlets = []
+    for d in all_outlet_domains:
         if d not in seen:
             seen.add(d)
-            uniq_domains.append(d)
+            uniq_outlets.append(d)
 
-    trusted_found = set()
-    for dom in uniq_domains:
-        for td in TRUSTED_DOMAINS:
-            tdn = normalize_domain(td)
-            if dom == tdn or dom.endswith("." + tdn):
-                trusted_found.add(td)
-                break
+    # Sort evidence: trusted first, then by domain, then title length
+    evidence_sorted = sorted(
+        evidence,
+        key=lambda x: (0 if x["trusted"] else 1, x["domain"], -len(x.get("title") or "")),
+    )
+
+    # Keep a reasonable amount
+    TOP_EVIDENCE = 8
+    evidence_sorted = evidence_sorted[:TOP_EVIDENCE]
 
     return {
         "ok": True,
-        "engine": "bing_rss",
         "status_code": 200,
         "rss_url": rss_url,
-        "all_outlets_hits": len(uniq_domains),
-        "all_outlets_domains": uniq_domains,
-        "trusted_hits": len(trusted_found),
-        "trusted_domains": sorted(trusted_found),
-        "resolved_count": min(len(to_resolve), N_RESOLVE),
+        "resolved_count": resolved_count,
+        "all_outlets_hits": len(uniq_outlets),
+        "all_outlets_domains": uniq_outlets,
+        "trusted_hits": len(trusted_domains_found),
+        "trusted_domains": sorted(trusted_domains_found),
+        "evidence_links": evidence_sorted,
     }
 
 
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
-    """
-    V7.1 corroboration:
-    - Use Bing News RSS (free) and unwrap/resolve to real outlets
-    - Score uses trusted_hits; debug includes all outlet domains sample
-    """
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
-        return {"hits": None, "domains": [], "queries_used": [], "engine": "none", "debug": {}}
+        return {"hits": None, "domains": [], "queries_used": [], "engine": "none", "debug": {}, "evidence_links": []}
 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v7_1::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7_2::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -642,9 +629,10 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 "queries_used": cached.get("queries_used", [claim_query]),
                 "engine": cached.get("engine", "cache"),
                 "debug": cached.get("debug", {}),
+                "evidence_links": cached.get("evidence_links", []),
             }
 
-    br = await bing_rss_corroboration(claim_query, exclude_domain)
+    br = await bing_rss_corroboration_with_links(claim_query, exclude_domain)
 
     if not br.get("ok"):
         result = {
@@ -658,6 +646,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 "rss_url": br.get("rss_url"),
                 "note": "Bing RSS fetch failed; corroboration unavailable.",
             },
+            "evidence_links": [],
         }
         CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
         return result
@@ -677,6 +666,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             "all_outlets_hits": br.get("all_outlets_hits"),
             "all_outlets_sample": sample_all,
         },
+        "evidence_links": br.get("evidence_links", []) or [],
     }
     CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
     return result
@@ -716,6 +706,7 @@ async def fetch_extract(url: str) -> dict:
                 "corroboration_queries": [],
                 "corroboration_engine": None,
                 "corroboration_debug": {"note": "Blocked by site (401/403)."},
+                "corroboration_evidence": [],
             }
 
         r.raise_for_status()
@@ -753,6 +744,7 @@ async def fetch_extract(url: str) -> dict:
         "corroboration_queries": corro.get("queries_used", []),
         "corroboration_engine": corro.get("engine"),
         "corroboration_debug": corro.get("debug", {}),
+        "corroboration_evidence": corro.get("evidence_links", []),
     }
 
 
@@ -1258,6 +1250,10 @@ def og_image(scan_id: str):
 # Share page
 # -------------------------
 
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 @app.get("/result/{scan_id}", response_class=HTMLResponse)
 def result_page(scan_id: str, request: Request):
     item = db_get_scan(scan_id)
@@ -1297,7 +1293,7 @@ def result_page(scan_id: str, request: Request):
 
 <style>
 body { font-family: Arial, sans-serif; background:#0b1020; color:#eaf0ff; margin:0; padding:40px; }
-.card { background:#111933; padding:24px; border-radius:16px; max-width:900px; margin:auto; border:1px solid rgba(255,255,255,.12); }
+.card { background:#111933; padding:24px; border-radius:16px; max-width:950px; margin:auto; border:1px solid rgba(255,255,255,.12); }
 .muted { opacity:.75; }
 .score { font-size:42px; font-weight:800; margin-top:10px; }
 .band { font-size:18px; opacity:.8; }
@@ -1307,6 +1303,11 @@ button { padding:10px 14px; border-radius:10px; border:1px solid rgba(255,255,25
 button:hover { background:rgba(255,255,255,.12); }
 code { background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; }
 pre { background:rgba(0,0,0,.25); padding:12px; border-radius:12px; overflow:auto; }
+a { color:#b9ccff; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; background:rgba(255,255,255,.09); border:1px solid rgba(255,255,255,.12); margin-right:8px; }
+.tagTrusted { background: rgba(60,220,150,.16); border-color: rgba(60,220,150,.25); }
+.tagOther { background: rgba(255,210,90,.14); border-color: rgba(255,210,90,.22); }
 </style>
 </head>
 <body>
@@ -1334,6 +1335,24 @@ function esc(s){
 
 function copyLink() {
   navigator.clipboard.writeText(window.location.href);
+}
+
+function renderEvidence(list){
+  if (!list || list.length === 0) {
+    return "<div class='muted'>No corroboration links available.</div>";
+  }
+  return "<div style='margin-top:10px; display:flex; flex-direction:column; gap:10px;'>" + list.map(e => {
+    const tag = e.trusted ? "<span class='badge tagTrusted'>Trusted</span>" : "<span class='badge tagOther'>Other outlet</span>";
+    const title = esc(e.title || e.domain || e.url);
+    const dom = esc(e.domain || "");
+    const url = esc(e.url || "");
+    return `
+      <div style="padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,.12); background:rgba(0,0,0,.20);">
+        <div>${tag}<span class="muted">${dom}</span></div>
+        <div style="margin-top:6px; font-weight:700;"><a href="${url}" target="_blank" rel="noreferrer">${title}</a></div>
+      </div>
+    `;
+  }).join("") + "</div>";
 }
 
 async function load() {
@@ -1380,6 +1399,7 @@ async function load() {
   const debug = sig.corroboration_debug || {};
   const allHits = debug.all_outlets_hits;
   const allSample = debug.all_outlets_sample || [];
+  const evidenceLinks = sig.corroboration_evidence || [];
 
   document.getElementById("content").innerHTML = `
     <div class="score">${r.overall_score}/100</div>
@@ -1409,7 +1429,10 @@ async function load() {
 
       <div class="muted" style="margin-top:8px;">Claim query used: <code>${qLine}</code></div>
 
-      <details style="margin-top:10px;">
+      <h3 style="margin:18px 0 6px;">Corroboration Evidence</h3>
+      ${renderEvidence(evidenceLinks)}
+
+      <details style="margin-top:14px;">
         <summary class="muted">Debug</summary>
         <pre>${esc(JSON.stringify(debug, null, 2))}</pre>
       </details>
