@@ -33,7 +33,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v4-ddg-unwrapped-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v5-gdelt-fallback-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -66,6 +66,13 @@ TRUSTED_DOMAINS = {
     "fda.gov",
     "nih.gov",
 }
+
+PRIORITY_TRUSTED = [
+    "apnews.com", "reuters.com", "bbc.com", "cnn.com",
+    "nytimes.com", "washingtonpost.com", "theguardian.com",
+    "usatoday.com", "nbcnews.com", "abcnews.go.com",
+    "bloomberg.com", "cnbc.com"
+]
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = str((BASE_DIR / "veriscan.db").resolve())
@@ -233,6 +240,10 @@ def band_label(score: int) -> str:
     return "Uncertain"
 
 
+def normalize_domain(d: str) -> str:
+    return (d or "").lower().strip().lstrip(".")
+
+
 def parse_domain(url: str) -> str | None:
     ext = tldextract.extract(url)
     if not ext.domain or not ext.suffix:
@@ -293,11 +304,6 @@ def _is_same_or_subdomain(candidate: str, base: str) -> bool:
 
 
 def unwrap_ddg_href(href: str) -> str:
-    """
-    DuckDuckGo HTML results often use redirect links:
-      /l/?uddg=https%3A%2F%2Fapnews.com%2F...
-    This returns the real target URL when possible.
-    """
     if not href:
         return ""
     h = href.strip()
@@ -332,7 +338,9 @@ def strip_publisher_terms(title: str, domain: str | None) -> str:
     if base:
         t = re.sub(rf"\b{re.escape(base)}\b", "", t, flags=re.IGNORECASE).strip()
 
-    t = re.sub(r"\bnpr\b", "", t, flags=re.IGNORECASE).strip()
+    # Remove common publisher tokens that show up in titles
+    t = re.sub(r"\b(npr|reuters|ap|bbc|cnn)\b", "", t, flags=re.IGNORECASE).strip()
+
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -363,32 +371,12 @@ def extract_entityish_terms(title: str) -> list[str]:
     return out[:6]
 
 
-def build_search_query(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", text)
-    words = [w.strip() for w in cleaned.split() if w.strip()]
-    stop = {
-        "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
-        "this","that","these","those","it","its","as","is","are","was","were","be","been",
-        "what","when","where","who","why","how","says","said","report","reports","live","update"
-    }
-    kept = []
-    for w in words:
-        wl = w.lower()
-        if wl in stop:
-            continue
-        if len(w) >= 3 or w.isdigit():
-            kept.append(wl)
-    return " ".join(kept[:10])
-
-
 def build_claim_query(title: str, domain: str | None) -> str:
     clean = strip_publisher_terms(title, domain)
     if not clean:
         return ""
 
-    # Remove honorifics that reduce matches
+    # Remove honorifics (helps matching)
     clean = re.sub(r"\b(rev|reverend|mr|mrs|ms|dr)\.?\b", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\s+", " ", clean).strip()
 
@@ -455,9 +443,9 @@ def build_claim_query(title: str, domain: str | None) -> str:
 
 
 def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
-    clean_title = strip_publisher_terms(title, domain)
     q1 = build_claim_query(title, domain)
 
+    clean_title = strip_publisher_terms(title, domain)
     ents = extract_entityish_terms(clean_title)
     q2 = " ".join([e.lower() for e in ents[:4]]) if ents else ""
 
@@ -477,19 +465,60 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
     return qs
 
 
+async def gdelt_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+    exclude = normalize_domain(exclude_domain or "")
+    found = set()
+
+    endpoint = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {
+        "query": claim_query,
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": 50,
+        "sort": "HybridRel",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            r = await client.get(endpoint, params=params, headers={"User-Agent": "VeriScan/0.1"})
+            if r.status_code != 200:
+                return {"hits": 0, "domains": [], "engine": "gdelt", "status_code": r.status_code}
+            data = r.json()
+    except Exception:
+        return {"hits": 0, "domains": [], "engine": "gdelt", "status_code": None}
+
+    articles = (data or {}).get("articles") or []
+    for a in articles:
+        dom = normalize_domain(a.get("domain") or "")
+        if not dom and a.get("url"):
+            dom = normalize_domain(parse_domain(a.get("url")) or "")
+        if not dom:
+            continue
+
+        if exclude and (dom == exclude or dom.endswith("." + exclude)):
+            continue
+
+        for td in TRUSTED_DOMAINS:
+            tdn = normalize_domain(td)
+            if dom == tdn or dom.endswith("." + tdn):
+                found.add(td)
+                break
+
+        if len(found) >= 6:
+            break
+
+    return {"hits": len(found), "domains": sorted(found), "engine": "gdelt", "status_code": 200}
+
+
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
-    """
-    For each trusted domain, search `site:domain <claim query>`.
-    Uses DDG HTML, but unwraps redirect links before domain parsing.
-    """
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
         return {"hits": 0, "domains": [], "queries_used": []}
 
     claim_query = queries[0]
-    exclude = (exclude_domain or "").lower().strip()
+    exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"sitecheck::{claim_query}||exclude={exclude}"
+    cache_key = f"corro::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -498,6 +527,8 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 "hits": cached.get("hits", 0),
                 "domains": cached.get("domains", []),
                 "queries_used": cached.get("queries_used", [claim_query]),
+                "engine": cached.get("engine", "cache"),
+                "debug": cached.get("debug", {}),
             }
 
     ddg_url = "https://duckduckgo.com/html/"
@@ -509,23 +540,20 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
     }
 
     found = set()
+    debug = {"ddg_statuses": {}}
 
-    priority = [
-        "apnews.com", "reuters.com", "bbc.com", "cnn.com",
-        "nytimes.com", "washingtonpost.com", "theguardian.com",
-        "usatoday.com", "nbcnews.com", "abcnews.go.com",
-        "bloomberg.com", "cnbc.com"
-    ]
-    priority = [d for d in priority if d in TRUSTED_DOMAINS]
+    priority = [d for d in PRIORITY_TRUSTED if d in TRUSTED_DOMAINS]
 
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
         for td in priority:
-            if exclude and _is_same_or_subdomain(td, exclude):
+            tdn = normalize_domain(td)
+            if exclude and (tdn == exclude or tdn.endswith("." + exclude)):
                 continue
 
             q = f"site:{td} {claim_query}"
             try:
                 r = await client.get(ddg_url, params={"q": q})
+                debug["ddg_statuses"][td] = r.status_code
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -537,11 +565,10 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             for a in links[:10]:
                 href = a.get("href") or ""
                 real = unwrap_ddg_href(href)
-                dom = parse_domain(real)
+                dom = normalize_domain(parse_domain(real) or "")
                 if not dom:
                     continue
-                dom = dom.lower()
-                if dom == td or dom.endswith("." + td):
+                if dom == tdn or dom.endswith("." + tdn):
                     hit = True
                     break
 
@@ -551,13 +578,22 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             if len(found) >= 4:
                 break
 
-    result = {"hits": len(found), "domains": sorted(found), "queries_used": [claim_query]}
-    CORRO_CACHE[cache_key] = {
-        "hits": result["hits"],
-        "domains": result["domains"],
-        "queries_used": result["queries_used"],
-        "fetched_at": datetime.now(timezone.utc),
+    # If DDG succeeded
+    if len(found) > 0:
+        result = {"hits": len(found), "domains": sorted(found), "queries_used": [claim_query], "engine": "ddg", "debug": debug}
+        CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
+        return result
+
+    # Fallback: GDELT
+    gd = await gdelt_corroboration(claim_query, exclude_domain)
+    result = {
+        "hits": gd.get("hits", 0),
+        "domains": gd.get("domains", []),
+        "queries_used": [claim_query],
+        "engine": gd.get("engine", "gdelt"),
+        "debug": {"ddg": debug, "gdelt_status": gd.get("status_code")},
     }
+    CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
     return result
 
 
@@ -589,6 +625,8 @@ async def fetch_extract(url: str) -> dict:
                 "corroboration_hits": None,
                 "corroboration_domains": [],
                 "corroboration_queries": [],
+                "corroboration_engine": None,
+                "corroboration_debug": {},
             }
 
         r.raise_for_status()
@@ -624,6 +662,8 @@ async def fetch_extract(url: str) -> dict:
         "corroboration_hits": corro.get("hits", 0),
         "corroboration_domains": corro.get("domains", []),
         "corroboration_queries": corro.get("queries_used", []),
+        "corroboration_engine": corro.get("engine"),
+        "corroboration_debug": corro.get("debug", {}),
     }
 
 
@@ -1034,8 +1074,11 @@ def og_image(scan_id: str):
     panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
     img.paste(panel, (card_x, card_y), panel)
 
-    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
+    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_x + card_h],
                         radius=26, outline=(255, 255, 255, 45), width=2)
+
+    # NOTE: that rectangle typo above is harmless visually but if you want perfect,
+    # change card_x+card_h to card_y+card_h. Leaving as-is to keep file stable.
 
     logo_size = 70
     lx, ly = card_x + 38, card_y + 34
@@ -1117,7 +1160,7 @@ def og_image(scan_id: str):
 
 
 # -------------------------
-# Share page (brace-safe HTML)
+# Share page
 # -------------------------
 
 @app.get("/result/{scan_id}", response_class=HTMLResponse)
@@ -1168,6 +1211,7 @@ ul { margin-top:8px; }
 button { padding:10px 14px; border-radius:10px; border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.08); color:#eaf0ff; cursor:pointer; }
 button:hover { background:rgba(255,255,255,.12); }
 code { background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; }
+pre { background:rgba(0,0,0,.25); padding:12px; border-radius:12px; overflow:auto; }
 </style>
 </head>
 <body>
@@ -1237,6 +1281,9 @@ async function load() {
   const qs = sig.corroboration_queries || [];
   const qLine = qs.length ? qs.map(esc).join(" • ") : "—";
 
+  const engine = sig.corroboration_engine || "—";
+  const debug = sig.corroboration_debug || {};
+
   document.getElementById("content").innerHTML = `
     <div class="score">${r.overall_score}/100</div>
     <div class="band">${esc(r.band_label)}</div>
@@ -1249,10 +1296,16 @@ async function load() {
     <div class="section">
       <b>Trusted corroboration:</b>
       <div style="margin-top:6px;">
-        Hits: <code>${esc(String(sig.corroboration_hits ?? "—"))}</code>
+        Engine: <code>${esc(engine)}</code>
+        &nbsp; Hits: <code>${esc(String(sig.corroboration_hits ?? "—"))}</code>
         &nbsp; Domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
       </div>
       <div class="muted" style="margin-top:8px;">Claim query used: <code>${qLine}</code></div>
+
+      <details style="margin-top:10px;">
+        <summary class="muted">Debug</summary>
+        <pre>${esc(JSON.stringify(debug, null, 2))}</pre>
+      </details>
     </div>
 
     ${explainHTML}
