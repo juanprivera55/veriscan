@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 from datetime import datetime, timezone
 import uuid
 import asyncio
@@ -33,7 +33,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v3-claimquery-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v4-ddg-unwrapped-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -292,16 +292,40 @@ def _is_same_or_subdomain(candidate: str, base: str) -> bool:
     return candidate == base or candidate.endswith("." + base)
 
 
+def unwrap_ddg_href(href: str) -> str:
+    """
+    DuckDuckGo HTML results often use redirect links:
+      /l/?uddg=https%3A%2F%2Fapnews.com%2F...
+    This returns the real target URL when possible.
+    """
+    if not href:
+        return ""
+    h = href.strip()
+
+    if h.startswith("https://duckduckgo.com/l/") or h.startswith("http://duckduckgo.com/l/"):
+        try:
+            q = urlparse(h).query
+            uddg = parse_qs(q).get("uddg", [""])[0]
+            return unquote(uddg) if uddg else h
+        except Exception:
+            return h
+
+    if h.startswith("/l/?") or h.startswith("/l/"):
+        try:
+            q = urlparse("https://duckduckgo.com" + h).query
+            uddg = parse_qs(q).get("uddg", [""])[0]
+            return unquote(uddg) if uddg else h
+        except Exception:
+            return h
+
+    return h
+
+
 def strip_publisher_terms(title: str, domain: str | None) -> str:
-    """
-    Remove publisher suffix (': NPR') and base domain token (npr, reuters, etc.)
-    so we search the claim, not the publisher.
-    """
     t = (title or "").strip()
     if not t:
         return ""
 
-    # Strip trailing " : NPR" or "| NPR" style endings
     t = re.sub(r"\s*[:\|\-]\s*[A-Za-z0-9\.]{2,}\s*$", "", t).strip()
 
     base = (domain or "").split(".")[0].lower().strip()
@@ -314,11 +338,6 @@ def strip_publisher_terms(title: str, domain: str | None) -> str:
 
 
 def extract_entityish_terms(title: str) -> list[str]:
-    """
-    Lightweight entity-like detection:
-    - TitleCase words (Jesse, Jackson)
-    - ALLCAPS (SEC, FBI)
-    """
     if not title:
         return []
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-’']+", title)
@@ -345,9 +364,6 @@ def extract_entityish_terms(title: str) -> list[str]:
 
 
 def build_search_query(text: str) -> str:
-    """
-    Generic keyword query builder from text.
-    """
     if not text:
         return ""
     cleaned = re.sub(r"[^A-Za-z0-9\s]", " ", text)
@@ -368,12 +384,13 @@ def build_search_query(text: str) -> str:
 
 
 def build_claim_query(title: str, domain: str | None) -> str:
-    """
-    Claim-focused query: entity + action + key numbers (+ a couple strong extras)
-    """
     clean = strip_publisher_terms(title, domain)
     if not clean:
         return ""
+
+    # Remove honorifics that reduce matches
+    clean = re.sub(r"\b(rev|reverend|mr|mrs|ms|dr)\.?\b", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\s+", " ", clean).strip()
 
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-’']+|\d+", clean)
 
@@ -388,7 +405,7 @@ def build_claim_query(title: str, domain: str | None) -> str:
         "the","a","an","and","or","but","to","of","in","on","for","with","from","by","at",
         "this","that","these","those","it","its","as","is","are","was","were","be","been",
         "longtime","latest","update","live","exclusive","report","reports","analysis","opinion",
-        "leader","leaders"
+        "leader","leaders","civil","rights"
     }
 
     entities = extract_entityish_terms(clean)
@@ -438,11 +455,6 @@ def build_claim_query(title: str, domain: str | None) -> str:
 
 
 def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
-    """
-    Q1: claim-focused
-    Q2: entity-only
-    Q3: publisher+claim fallback (kept but not dominant)
-    """
     clean_title = strip_publisher_terms(title, domain)
     q1 = build_claim_query(title, domain)
 
@@ -467,8 +479,8 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
     """
-    Reliable corroboration: for each priority trusted domain,
-    search `site:trusted <claim_query>` and count hits.
+    For each trusted domain, search `site:domain <claim query>`.
+    Uses DDG HTML, but unwraps redirect links before domain parsing.
     """
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
@@ -522,9 +534,10 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 continue
 
             hit = False
-            for a in links[:8]:
+            for a in links[:10]:
                 href = a.get("href") or ""
-                dom = parse_domain(href)
+                real = unwrap_ddg_href(href)
+                dom = parse_domain(real)
                 if not dom:
                     continue
                 dom = dom.lower()
@@ -966,7 +979,7 @@ def get_scan(scan_id: str):
 
 
 # -------------------------
-# OG Image (unchanged)
+# OG Image
 # -------------------------
 
 def _html_escape(s: str) -> str:
