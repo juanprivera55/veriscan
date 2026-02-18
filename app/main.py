@@ -33,7 +33,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v5-gdelt-fallback-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v6-brave-search-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -41,6 +41,13 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 # Caches
 DOMAIN_AGE_CACHE: dict[str, dict] = {}
 CORRO_CACHE: dict[str, dict] = {}
+
+# Env
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SQLITE_PATH = str((BASE_DIR / "veriscan.db").resolve())
+POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
 
 TRUSTED_DOMAINS = {
     "reuters.com",
@@ -61,6 +68,11 @@ TRUSTED_DOMAINS = {
     "forbes.com",
     "time.com",
     "economist.com",
+    "aljazeera.com",
+    "propublica.org",
+    "pbs.org",
+    "axios.com",
+    "politico.com",
     "who.int",
     "cdc.gov",
     "fda.gov",
@@ -71,12 +83,8 @@ PRIORITY_TRUSTED = [
     "apnews.com", "reuters.com", "bbc.com", "cnn.com",
     "nytimes.com", "washingtonpost.com", "theguardian.com",
     "usatoday.com", "nbcnews.com", "abcnews.go.com",
-    "bloomberg.com", "cnbc.com"
+    "bloomberg.com", "cnbc.com", "aljazeera.com", "pbs.org", "propublica.org"
 ]
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-SQLITE_PATH = str((BASE_DIR / "veriscan.db").resolve())
-POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
 
 # -------------------------
@@ -299,10 +307,6 @@ async def rdap_domain_age_days(domain: str) -> int | None:
     return age_days
 
 
-def _is_same_or_subdomain(candidate: str, base: str) -> bool:
-    return candidate == base or candidate.endswith("." + base)
-
-
 def unwrap_ddg_href(href: str) -> str:
     if not href:
         return ""
@@ -332,15 +336,14 @@ def strip_publisher_terms(title: str, domain: str | None) -> str:
     if not t:
         return ""
 
+    # Remove trailing publisher markers like ": NPR" or "| CNN"
     t = re.sub(r"\s*[:\|\-]\s*[A-Za-z0-9\.]{2,}\s*$", "", t).strip()
 
     base = (domain or "").split(".")[0].lower().strip()
     if base:
         t = re.sub(rf"\b{re.escape(base)}\b", "", t, flags=re.IGNORECASE).strip()
 
-    # Remove common publisher tokens that show up in titles
     t = re.sub(r"\b(npr|reuters|ap|bbc|cnn)\b", "", t, flags=re.IGNORECASE).strip()
-
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -376,7 +379,7 @@ def build_claim_query(title: str, domain: str | None) -> str:
     if not clean:
         return ""
 
-    # Remove honorifics (helps matching)
+    # Remove honorifics that reduce matching
     clean = re.sub(r"\b(rev|reverend|mr|mrs|ms|dr)\.?\b", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"\s+", " ", clean).strip()
 
@@ -465,33 +468,49 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
     return qs
 
 
-async def gdelt_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+# -------------------------
+# Corroboration Engines
+# -------------------------
+
+async def brave_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+    """
+    Preferred: real web search via Brave Search API.
+    """
+    if not BRAVE_API_KEY:
+        return {"hits": None, "domains": [], "engine": "brave", "status_code": None, "error": "missing BRAVE_API_KEY"}
+
     exclude = normalize_domain(exclude_domain or "")
     found = set()
 
-    endpoint = "https://api.gdeltproject.org/api/v2/doc/doc"
+    url = "https://api.search.brave.com/res/v1/web/search"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": BRAVE_API_KEY,
+        "User-Agent": "VeriScan/0.1",
+    }
     params = {
-        "query": claim_query,
-        "mode": "ArtList",
-        "format": "json",
-        "maxrecords": 50,
-        "sort": "HybridRel",
+        "q": claim_query,
+        "count": 30,
+        "country": "us",
+        "search_lang": "en",
+        # bias recent (past week) for breaking news; change to "pm"/"py" if you want broader
+        "freshness": "pw",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            r = await client.get(endpoint, params=params, headers={"User-Agent": "VeriScan/0.1"})
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            r = await client.get(url, headers=headers, params=params)
             if r.status_code != 200:
-                return {"hits": 0, "domains": [], "engine": "gdelt", "status_code": r.status_code}
+                return {"hits": None, "domains": [], "engine": "brave", "status_code": r.status_code}
             data = r.json()
-    except Exception:
-        return {"hits": 0, "domains": [], "engine": "gdelt", "status_code": None}
+    except Exception as e:
+        return {"hits": None, "domains": [], "engine": "brave", "status_code": None, "error": str(e)}
 
-    articles = (data or {}).get("articles") or []
-    for a in articles:
-        dom = normalize_domain(a.get("domain") or "")
-        if not dom and a.get("url"):
-            dom = normalize_domain(parse_domain(a.get("url")) or "")
+    results = (((data or {}).get("web") or {}).get("results") or [])
+    for item in results:
+        u = (item or {}).get("url") or ""
+        dom = normalize_domain(parse_domain(u) or "")
         if not dom:
             continue
 
@@ -504,32 +523,20 @@ async def gdelt_corroboration(claim_query: str, exclude_domain: str | None) -> d
                 found.add(td)
                 break
 
-        if len(found) >= 6:
+        if len(found) >= 10:
             break
 
-    return {"hits": len(found), "domains": sorted(found), "engine": "gdelt", "status_code": 200}
+    return {"hits": len(found), "domains": sorted(found), "engine": "brave", "status_code": 200}
 
 
-async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
-    queries = [q.strip() for q in (queries or []) if q and q.strip()]
-    if not queries:
-        return {"hits": 0, "domains": [], "queries_used": []}
-
-    claim_query = queries[0]
+async def ddg_site_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
+    """
+    Backup only (scraping DDG is flaky on cloud servers).
+    Kept as a no-key fallback so demo doesn't "break" if BRAVE_API_KEY missing.
+    """
     exclude = normalize_domain(exclude_domain or "")
-
-    cache_key = f"corro::{claim_query}||exclude={exclude}"
-    cached = CORRO_CACHE.get(cache_key)
-    if cached:
-        fetched_at: datetime = cached.get("fetched_at")
-        if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 12 * 3600:
-            return {
-                "hits": cached.get("hits", 0),
-                "domains": cached.get("domains", []),
-                "queries_used": cached.get("queries_used", [claim_query]),
-                "engine": cached.get("engine", "cache"),
-                "debug": cached.get("debug", {}),
-            }
+    found = set()
+    debug = {"ddg_statuses": {}}
 
     ddg_url = "https://duckduckgo.com/html/"
     headers = {
@@ -538,9 +545,6 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://duckduckgo.com/",
     }
-
-    found = set()
-    debug = {"ddg_statuses": {}}
 
     priority = [d for d in PRIORITY_TRUSTED if d in TRUSTED_DOMAINS]
 
@@ -578,24 +582,80 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             if len(found) >= 4:
                 break
 
-    # If DDG succeeded
-    if len(found) > 0:
-        result = {"hits": len(found), "domains": sorted(found), "queries_used": [claim_query], "engine": "ddg", "debug": debug}
+    # Note: if cloud bot mitigation happens, this will often return 0 with 202 statuses.
+    return {"hits": len(found), "domains": sorted(found), "engine": "ddg", "status_code": 200, "debug": debug}
+
+
+async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
+    """
+    V6 corroboration:
+    - Use Brave Search API (real search results) if available
+    - Else fallback to DDG site: checks (demo-only)
+    """
+    queries = [q.strip() for q in (queries or []) if q and q.strip()]
+    if not queries:
+        return {"hits": None, "domains": [], "queries_used": [], "engine": "none", "debug": {}}
+
+    claim_query = queries[0]
+    exclude = normalize_domain(exclude_domain or "")
+
+    cache_key = f"corro_v6::{claim_query}||exclude={exclude}"
+    cached = CORRO_CACHE.get(cache_key)
+    if cached:
+        fetched_at: datetime = cached.get("fetched_at")
+        if fetched_at and (datetime.now(timezone.utc) - fetched_at).total_seconds() < 6 * 3600:
+            return {
+                "hits": cached.get("hits"),
+                "domains": cached.get("domains", []),
+                "queries_used": cached.get("queries_used", [claim_query]),
+                "engine": cached.get("engine", "cache"),
+                "debug": cached.get("debug", {}),
+            }
+
+    # 1) Brave (best)
+    br = await brave_corroboration(claim_query, exclude_domain)
+    if br.get("hits") is not None:
+        result = {
+            "hits": br.get("hits"),
+            "domains": br.get("domains", []),
+            "queries_used": [claim_query],
+            "engine": br.get("engine", "brave"),
+            "debug": {"brave_status": br.get("status_code"), "brave_error": br.get("error")},
+        }
         CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
         return result
 
-    # Fallback: GDELT
-    gd = await gdelt_corroboration(claim_query, exclude_domain)
-    result = {
-        "hits": gd.get("hits", 0),
-        "domains": gd.get("domains", []),
-        "queries_used": [claim_query],
-        "engine": gd.get("engine", "gdelt"),
-        "debug": {"ddg": debug, "gdelt_status": gd.get("status_code")},
-    }
+    # 2) DDG fallback (no-key demo fallback)
+    dd = await ddg_site_corroboration(claim_query, exclude_domain)
+    # If DDG returns 0 but also shows suspicious status codes (like 202), treat as unavailable, not "0"
+    debug = dd.get("debug", {})
+    ddg_statuses = (debug.get("ddg_statuses") or {}) if isinstance(debug, dict) else {}
+    suspicious = any(int(v) == 202 for v in ddg_statuses.values()) if ddg_statuses else False
+
+    if suspicious and dd.get("hits", 0) == 0:
+        result = {
+            "hits": None,
+            "domains": [],
+            "queries_used": [claim_query],
+            "engine": "ddg",
+            "debug": {"ddg": debug, "note": "DDG returned bot/mitigation statuses; corroboration unavailable."},
+        }
+    else:
+        result = {
+            "hits": dd.get("hits", 0),
+            "domains": dd.get("domains", []),
+            "queries_used": [claim_query],
+            "engine": dd.get("engine", "ddg"),
+            "debug": {"ddg": debug},
+        }
+
     CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
     return result
 
+
+# -------------------------
+# Extraction
+# -------------------------
 
 async def fetch_extract(url: str) -> dict:
     headers = {
@@ -626,7 +686,7 @@ async def fetch_extract(url: str) -> dict:
                 "corroboration_domains": [],
                 "corroboration_queries": [],
                 "corroboration_engine": None,
-                "corroboration_debug": {},
+                "corroboration_debug": {"note": "Blocked by site (401/403)."},
             }
 
         r.raise_for_status()
@@ -659,7 +719,7 @@ async def fetch_extract(url: str) -> dict:
         "domain": domain,
         "domain_age_days": domain_age_days,
         "blocked": False,
-        "corroboration_hits": corro.get("hits", 0),
+        "corroboration_hits": corro.get("hits"),
         "corroboration_domains": corro.get("domains", []),
         "corroboration_queries": corro.get("queries_used", []),
         "corroboration_engine": corro.get("engine"),
@@ -685,7 +745,10 @@ def score_link(signals: dict) -> dict:
     source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
 
     hits = signals.get("corroboration_hits")
-    cross_verify = 50 if hits is None else clamp(int(min(100, hits * 25)))
+    if hits is None:
+        cross_verify = 50
+    else:
+        cross_verify = clamp(int(min(100, hits * 25)))
 
     ai_manip = 50
     context = 60 if signals.get("title") else 40
@@ -714,10 +777,16 @@ def score_link(signals: dict) -> dict:
             "but article content could not be fetched."
         )
     else:
-        summary = (
-            f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-            f"Trusted-source corroboration found: {hits if isinstance(hits, int) else 'N/A'} other trusted domain(s)."
-        )
+        if hits is None:
+            summary = (
+                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+                f"Trusted-source corroboration was unavailable for this scan (search provider blocked/failed)."
+            )
+        else:
+            summary = (
+                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
+                f"Trusted-source corroboration found: {hits} other trusted domain(s)."
+            )
 
     return {
         "overall_score": overall,
@@ -829,7 +898,7 @@ def build_explanation(report: dict) -> dict:
             concerns.append("No matches were found on the trusted corroboration list (not proof of falsehood, but less support).")
     else:
         if is_link:
-            missing_items.append("Trusted corroboration check was unavailable for this scan.")
+            missing_items.append("Trusted corroboration check was unavailable (search provider blocked/failed).")
 
     age_days = signals.get("domain_age_days")
     if age_days is None and is_link:
@@ -1074,11 +1143,9 @@ def og_image(scan_id: str):
     panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
     img.paste(panel, (card_x, card_y), panel)
 
-    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_x + card_h],
+    # fixed typo (card_y + card_h)
+    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
                         radius=26, outline=(255, 255, 255, 45), width=2)
-
-    # NOTE: that rectangle typo above is harmless visually but if you want perfect,
-    # change card_x+card_h to card_y+card_h. Leaving as-is to keep file stable.
 
     logo_size = 70
     lx, ly = card_x + 38, card_y + 34
@@ -1297,7 +1364,7 @@ async function load() {
       <b>Trusted corroboration:</b>
       <div style="margin-top:6px;">
         Engine: <code>${esc(engine)}</code>
-        &nbsp; Hits: <code>${esc(String(sig.corroboration_hits ?? "—"))}</code>
+        &nbsp; Hits: <code>${esc(String(sig.corroboration_hits ?? "unavailable"))}</code>
         &nbsp; Domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
       </div>
       <div class="muted" style="margin-top:8px;">Claim query used: <code>${qLine}</code></div>
