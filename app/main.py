@@ -34,7 +34,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v7-bing-rss-alloutlets-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v7_1-bing-rss-unwrapped-2026-02-18"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -307,30 +307,6 @@ async def rdap_domain_age_days(domain: str) -> int | None:
     return age_days
 
 
-def unwrap_ddg_href(href: str) -> str:
-    if not href:
-        return ""
-    h = href.strip()
-
-    if h.startswith("https://duckduckgo.com/l/") or h.startswith("http://duckduckgo.com/l/"):
-        try:
-            q = urlparse(h).query
-            uddg = parse_qs(q).get("uddg", [""])[0]
-            return unquote(uddg) if uddg else h
-        except Exception:
-            return h
-
-    if h.startswith("/l/?") or h.startswith("/l/"):
-        try:
-            q = urlparse("https://duckduckgo.com" + h).query
-            uddg = parse_qs(q).get("uddg", [""])[0]
-            return unquote(uddg) if uddg else h
-        except Exception:
-            return h
-
-    return h
-
-
 def strip_publisher_terms(title: str, domain: str | None) -> str:
     t = (title or "").strip()
     if not t:
@@ -469,7 +445,7 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 
 # -------------------------
-# Corroboration: Bing News RSS (All Outlets)
+# Corroboration: Bing News RSS (All Outlets) — V7.1
 # -------------------------
 
 def _parse_rss_links(xml_text: str) -> list[str]:
@@ -483,8 +459,6 @@ def _parse_rss_links(xml_text: str) -> list[str]:
     except Exception:
         return urls
 
-    # RSS: channel/item/link
-    # Some feeds use namespaces; this approach ignores namespaces by checking endswith.
     for item in root.iter():
         if not item.tag.lower().endswith("item"):
             continue
@@ -497,12 +471,72 @@ def _parse_rss_links(xml_text: str) -> list[str]:
     return urls
 
 
+def _unwrap_bing_news_link(u: str) -> str:
+    """
+    Bing News RSS links often look like:
+      https://www.bing.com/news/apiclick?url=ENCODED...
+      https://www.bing.com/news/redirect?url=ENCODED...
+    Pull out the real publisher URL when present.
+    """
+    if not u:
+        return ""
+
+    try:
+        p = urlparse(u)
+    except Exception:
+        return u
+
+    host = (p.hostname or "").lower()
+    if "bing.com" not in host:
+        return u
+
+    qs = parse_qs(p.query)
+
+    for key in ("url", "u", "r", "RU"):
+        if key in qs and qs[key]:
+            return unquote(qs[key][0]).strip()
+
+    return u
+
+
+async def _resolve_final_url(u: str) -> str:
+    """
+    Last resort: follow redirects to get the final publisher URL.
+    Uses HEAD first, then GET if needed.
+    """
+    if not u:
+        return ""
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+            try:
+                r = await client.head(u)
+                if r.status_code < 400:
+                    return str(r.url)
+            except Exception:
+                pass
+
+            r = await client.get(u)
+            if r.status_code < 400:
+                return str(r.url)
+    except Exception:
+        return u
+
+    return u
+
+
 async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -> dict:
     """
     Free corroboration: Bing News RSS.
     Scans ALL outlets and counts:
-      - all_outlets_hits: number of unique outlet domains found
-      - trusted_hits: number of unique trusted domains found
+      - all_outlets_hits: unique outlet domains found (after unwrapping redirects)
+      - trusted_hits: unique trusted domains found
     """
     exclude = normalize_domain(exclude_domain or "")
     q = quote_plus(claim_query)
@@ -524,9 +558,30 @@ async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -
     except Exception as e:
         return {"ok": False, "engine": "bing_rss", "status_code": None, "error": str(e), "rss_url": rss_url}
 
-    links = _parse_rss_links(xml_text)
+    raw_links = _parse_rss_links(xml_text)
+
+    # Unwrap Bing redirect params first
+    unwrapped = [_unwrap_bing_news_link(u) for u in raw_links if u]
+
+    # If still bing.com links remain, resolve redirects (cap to keep it fast)
+    N_RESOLVE = 12
+    to_resolve = []
+    keep = []
+    for u in unwrapped:
+        dom = normalize_domain(parse_domain(u) or "")
+        if dom == "bing.com" or dom.endswith(".bing.com"):
+            to_resolve.append(u)
+        else:
+            keep.append(u)
+
+    resolved = []
+    for u in to_resolve[:N_RESOLVE]:
+        resolved.append(await _resolve_final_url(u))
+
+    all_links = keep + resolved
+
     all_domains: list[str] = []
-    for u in links:
+    for u in all_links:
         dom = normalize_domain(parse_domain(u) or "")
         if not dom:
             continue
@@ -534,7 +589,7 @@ async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -
             continue
         all_domains.append(dom)
 
-    # unique outlets, preserve rough order
+    # unique outlets, preserve order
     seen = set()
     uniq_domains = []
     for d in all_domains:
@@ -559,14 +614,15 @@ async def bing_rss_corroboration(claim_query: str, exclude_domain: str | None) -
         "all_outlets_domains": uniq_domains,
         "trusted_hits": len(trusted_found),
         "trusted_domains": sorted(trusted_found),
+        "resolved_count": min(len(to_resolve), N_RESOLVE),
     }
 
 
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
     """
-    V7 corroboration:
-    - Use Bing News RSS (free) to scan ALL outlets
-    - Score uses trusted_hits; debug includes all outlet domains
+    V7.1 corroboration:
+    - Use Bing News RSS (free) and unwrap/resolve to real outlets
+    - Score uses trusted_hits; debug includes all outlet domains sample
     """
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
@@ -575,7 +631,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v7::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7_1::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -606,10 +662,8 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
         CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
         return result
 
-    # Success
     all_domains = br.get("all_outlets_domains", []) or []
-    # keep debug small
-    sample_all = all_domains[:20]
+    sample_all = all_domains[:25]
 
     result = {
         "hits": br.get("trusted_hits", 0),
@@ -619,6 +673,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
         "debug": {
             "bing_status": br.get("status_code"),
             "rss_url": br.get("rss_url"),
+            "resolved_count": br.get("resolved_count"),
             "all_outlets_hits": br.get("all_outlets_hits"),
             "all_outlets_sample": sample_all,
         },
