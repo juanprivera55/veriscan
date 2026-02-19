@@ -34,7 +34,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v7_2-bing-rss-links-2026-02-18"
+APP_VERSION = "veriscan-corroboration-v7_3-syndication-unmask-2026-02-19"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -428,8 +428,12 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 
 # -------------------------
-# Corroboration: Bing News RSS with Evidence Links — V7.2
+# Corroboration: Bing News RSS with Evidence Links — V7.3
+# Adds syndication unmasking for MSN/Yahoo/AOL
 # -------------------------
+
+SYNDICATION_HOSTS = {"msn.com", "yahoo.com", "aol.com"}
+
 
 def _unwrap_bing_news_link(u: str) -> str:
     if not u:
@@ -482,7 +486,6 @@ def _parse_rss_items(xml_text: str) -> list[dict]:
     except Exception:
         return out
 
-    # Iterate items, ignore namespaces by checking tag suffix
     for item in root.iter():
         if not item.tag.lower().endswith("item"):
             continue
@@ -500,15 +503,136 @@ def _parse_rss_items(xml_text: str) -> list[dict]:
 
 
 def _is_trusted_domain(dom: str) -> str | None:
-    """
-    Returns the trusted domain matched (from TRUSTED_DOMAINS) or None.
-    """
     d = normalize_domain(dom)
     for td in TRUSTED_DOMAINS:
         tdn = normalize_domain(td)
         if d == tdn or d.endswith("." + tdn):
             return td
     return None
+
+
+def _abs_url(base_url: str, maybe_url: str) -> str:
+    if not maybe_url:
+        return ""
+    if maybe_url.startswith("http://") or maybe_url.startswith("https://"):
+        return maybe_url
+    # very small join fallback
+    try:
+        b = urlparse(base_url)
+        if maybe_url.startswith("//"):
+            return f"{b.scheme}:{maybe_url}"
+        if maybe_url.startswith("/"):
+            return f"{b.scheme}://{b.netloc}{maybe_url}"
+    except Exception:
+        return maybe_url
+    return maybe_url
+
+
+def _extract_best_publisher_url(html: str, fetched_url: str) -> str:
+    """
+    Try to find the original publisher URL from a syndication page.
+    Order:
+      canonical -> og:url -> parsely-link -> JSON-LD NewsArticle.url/mainEntityOfPage -> regex for originalUrl
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # canonical
+    canon = soup.find("link", rel=lambda x: x and "canonical" in x.lower())
+    if canon and canon.get("href"):
+        return _abs_url(fetched_url, canon["href"].strip())
+
+    # og:url
+    og = soup.find("meta", attrs={"property": "og:url"})
+    if og and og.get("content"):
+        return og["content"].strip()
+
+    # parsely-link
+    pl = soup.find("meta", attrs={"name": "parsely-link"})
+    if pl and pl.get("content"):
+        return pl["content"].strip()
+
+    # JSON-LD
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        if not s.string:
+            continue
+        raw = s.string.strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        candidates = []
+        stack = [data] if isinstance(data, (dict, list)) else []
+        while stack:
+            obj = stack.pop()
+            if isinstance(obj, dict):
+                t = obj.get("@type")
+                if isinstance(t, str) and ("NewsArticle" in t or t.lower() == "article"):
+                    for key in ("url",):
+                        if obj.get(key) and isinstance(obj.get(key), str):
+                            candidates.append(obj.get(key))
+                    me = obj.get("mainEntityOfPage")
+                    if isinstance(me, dict) and isinstance(me.get("@id"), str):
+                        candidates.append(me.get("@id"))
+                    if isinstance(me, str):
+                        candidates.append(me)
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+
+        for c in candidates:
+            if c and isinstance(c, str) and (c.startswith("http://") or c.startswith("https://")):
+                return c.strip()
+
+    # regex fallback: originalUrl":"https://....
+    m = re.search(r'originalUrl"\s*:\s*"([^"]+)"', html or "")
+    if m:
+        return m.group(1).replace("\\/", "/").strip()
+
+    return ""
+
+
+async def _unmask_syndication(url: str, client: httpx.AsyncClient) -> tuple[str, str] | None:
+    """
+    If url is on msn/yahoo/aol, fetch page and extract the true publisher URL+domain.
+    Returns (publisher_url, publisher_domain) or None.
+    """
+    dom = normalize_domain(parse_domain(url) or "")
+    if dom not in SYNDICATION_HOSTS:
+        return None
+
+    try:
+        r = await client.get(url)
+    except Exception:
+        return None
+
+    if r.status_code >= 400:
+        return None
+
+    final_url = str(r.url)
+    html = r.text or ""
+
+    best = _extract_best_publisher_url(html, final_url)
+    if not best:
+        # fallback: if final_url changed to a non-syndication domain, use that
+        fd = normalize_domain(parse_domain(final_url) or "")
+        if fd and fd not in SYNDICATION_HOSTS:
+            return (final_url, fd)
+        return None
+
+    pd = normalize_domain(parse_domain(best) or "")
+    if not pd:
+        return None
+    if pd in SYNDICATION_HOSTS:
+        return None
+
+    return (best, pd)
 
 
 async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: str | None) -> dict:
@@ -533,26 +657,23 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
 
     items = _parse_rss_items(xml_text)
 
-    # Unwrap links; resolve bing.com redirects (cap)
+    # Unwrap Bing links
     unwrapped = []
     for it in items:
         u = _unwrap_bing_news_link(it["link"])
         unwrapped.append({"title": it.get("title", ""), "link": u})
 
-    # resolve remaining bing.com links
-    N_RESOLVE = 12
-    resolved_count = 0
+    # Resolve remaining bing.com redirects (cap)
+    N_RESOLVE_BING = 12
+    resolved_bing = 0
     for it in unwrapped:
         dom = normalize_domain(parse_domain(it["link"]) or "")
-        if (dom == "bing.com" or dom.endswith(".bing.com")) and resolved_count < N_RESOLVE:
+        if (dom == "bing.com" or dom.endswith(".bing.com")) and resolved_bing < N_RESOLVE_BING:
             it["link"] = await _resolve_final_url(it["link"])
-            resolved_count += 1
+            resolved_bing += 1
 
-    # Build evidence lists
-    all_outlet_domains = []
+    # Build evidence items (initial)
     evidence = []
-    trusted_domains_found = set()
-
     seen_links = set()
     for it in unwrapped:
         link = (it.get("link") or "").strip()
@@ -566,42 +687,84 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
         if exclude and (dom == exclude or dom.endswith("." + exclude)):
             continue
 
-        all_outlet_domains.append(dom)
-
-        trusted_match = _is_trusted_domain(dom)
-        if trusted_match:
-            trusted_domains_found.add(trusted_match)
-
         evidence.append({
             "title": (it.get("title") or "").strip()[:220],
             "domain": dom,
             "url": link,
-            "trusted": bool(trusted_match),
+            "trusted": False,
+            "resolved_from": None,   # for syndication trace
         })
 
-    # unique outlets
+    # --- Syndication unmasking (MSN/Yahoo/AOL) ---
+    MAX_SYNDICATION_RESOLVE = 6
+    synd_targets = [e for e in evidence if e["domain"] in SYNDICATION_HOSTS][:MAX_SYNDICATION_RESOLVE]
+
+    synd_map = {}  # original_url -> (publisher_url, publisher_domain)
+    synd_ok = 0
+
+    if synd_targets:
+        headers2 = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers2) as client2:
+                # resolve sequentially to reduce risk of blocks
+                for e in synd_targets:
+                    res = await _unmask_syndication(e["url"], client2)
+                    if res:
+                        pub_url, pub_dom = res
+                        synd_map[e["url"]] = (pub_url, pub_dom)
+                        synd_ok += 1
+        except Exception:
+            pass
+
+    # Apply syndication mapping
+    for e in evidence:
+        if e["url"] in synd_map:
+            pub_url, pub_dom = synd_map[e["url"]]
+            if exclude and (pub_dom == exclude or pub_dom.endswith("." + exclude)):
+                continue
+            e["resolved_from"] = e["domain"]
+            e["domain"] = pub_dom
+            e["url"] = pub_url
+
+    # Now compute trusted + outlets
+    all_domains = [e["domain"] for e in evidence]
     seen = set()
     uniq_outlets = []
-    for d in all_outlet_domains:
+    for d in all_domains:
         if d not in seen:
             seen.add(d)
             uniq_outlets.append(d)
 
-    # Sort evidence: trusted first, then by domain, then title length
+    trusted_domains_found = set()
+    for e in evidence:
+        tm = _is_trusted_domain(e["domain"])
+        if tm:
+            e["trusted"] = True
+            trusted_domains_found.add(tm)
+
+    # Sort evidence: trusted first, then by domain
     evidence_sorted = sorted(
         evidence,
         key=lambda x: (0 if x["trusted"] else 1, x["domain"], -len(x.get("title") or "")),
     )
 
-    # Keep a reasonable amount
-    TOP_EVIDENCE = 8
+    TOP_EVIDENCE = 10
     evidence_sorted = evidence_sorted[:TOP_EVIDENCE]
 
     return {
         "ok": True,
         "status_code": 200,
         "rss_url": rss_url,
-        "resolved_count": resolved_count,
+        "resolved_bing_count": resolved_bing,
+        "syndication_attempted": len(synd_targets),
+        "syndication_resolved": synd_ok,
+        "syndication_samples": [
+            {"from": k, "to": v[0], "to_domain": v[1]} for k, v in list(synd_map.items())[:5]
+        ],
         "all_outlets_hits": len(uniq_outlets),
         "all_outlets_domains": uniq_outlets,
         "trusted_hits": len(trusted_domains_found),
@@ -618,7 +781,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v7_2::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7_3::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -662,9 +825,12 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
         "debug": {
             "bing_status": br.get("status_code"),
             "rss_url": br.get("rss_url"),
-            "resolved_count": br.get("resolved_count"),
+            "resolved_bing_count": br.get("resolved_bing_count"),
             "all_outlets_hits": br.get("all_outlets_hits"),
             "all_outlets_sample": sample_all,
+            "syndication_attempted": br.get("syndication_attempted"),
+            "syndication_resolved": br.get("syndication_resolved"),
+            "syndication_samples": br.get("syndication_samples", []),
         },
         "evidence_links": br.get("evidence_links", []) or [],
     }
@@ -1109,145 +1275,7 @@ def get_scan(scan_id: str):
 
 
 # -------------------------
-# OG Image
-# -------------------------
-
-def _html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _load_font(size: int) -> ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size=size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    t = (text or "").strip()
-    if len(t) <= max_chars:
-        return t
-    return t[: max_chars - 1].rstrip() + "…"
-
-
-def _band_color(band: str) -> tuple[int, int, int]:
-    b = (band or "").lower()
-    if "strong" in b:
-        return (60, 220, 150)
-    if "moderate" in b:
-        return (255, 210, 90)
-    if "limited" in b:
-        return (255, 150, 70)
-    if "weak" in b:
-        return (255, 110, 110)
-    return (200, 210, 230)
-
-
-@app.get("/og/{scan_id}.png")
-def og_image(scan_id: str):
-    item = db_get_scan(scan_id)
-    status = (item or {}).get("status", "not_found")
-
-    W, H = 1200, 630
-    img = Image.new("RGB", (W, H), (11, 16, 32))
-    d = ImageDraw.Draw(img)
-
-    d.ellipse((-200, -220, 520, 420), fill=(32, 60, 160))
-    d.ellipse((760, -240, 1500, 420), fill=(120, 28, 48))
-
-    veil = Image.new("RGBA", (W, H), (11, 16, 32, 170))
-    img = Image.alpha_composite(img.convert("RGBA"), veil).convert("RGBA")
-    d = ImageDraw.Draw(img)
-
-    card_x, card_y = 70, 70
-    card_w, card_h = W - 140, H - 140
-    panel = Image.new("RGBA", (card_w, card_h), (17, 28, 61, 220))
-    img.paste(panel, (card_x, card_y), panel)
-
-    d.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
-                        radius=26, outline=(255, 255, 255, 45), width=2)
-
-    logo_size = 70
-    lx, ly = card_x + 38, card_y + 34
-    d.rounded_rectangle([lx, ly, lx + logo_size, ly + logo_size], radius=22, fill=(120, 150, 255, 255))
-    d.rounded_rectangle([lx + 12, ly + 12, lx + logo_size - 12, ly + logo_size - 12],
-                        radius=18, fill=(255, 110, 110, 235))
-
-    f_brand = _load_font(36)
-    f_tag = _load_font(22)
-    f_h1 = _load_font(52)
-    f_big = _load_font(84)
-    f_band = _load_font(30)
-    f_body = _load_font(26)
-    f_small = _load_font(22)
-
-    d.text((lx + logo_size + 18, ly + 2), "VeriScan", font=f_brand, fill=(234, 240, 255, 255))
-    d.text((lx + logo_size + 18, ly + 46), "Scan. Analyze. Decide.", font=f_tag, fill=(168, 179, 214, 255))
-
-    score = None
-    band = None
-    summary = None
-    domain = None
-
-    if status == "complete" and item:
-        report = item.get("report") or {}
-        score = report.get("overall_score")
-        band = report.get("band_label")
-        summary = (report.get("summary_text") or "").strip()
-        signals = ((report.get("evidence") or {}).get("signals") or {})
-        domain = signals.get("domain") or ""
-
-    content_x = card_x + 38
-    content_y = card_y + 140
-
-    if status in ("queued", "running"):
-        d.text((content_x, content_y), "Report processing…", font=f_h1, fill=(234, 240, 255, 255))
-        d.text((content_x, content_y + 70), "Check back in a moment.", font=f_body, fill=(168, 179, 214, 255))
-    elif status == "error":
-        d.text((content_x, content_y), "Report error", font=f_h1, fill=(234, 240, 255, 255))
-        d.text((content_x, content_y + 70), "Something went wrong generating this report.", font=f_body, fill=(168, 179, 214, 255))
-    elif status == "not_found":
-        d.text((content_x, content_y), "Report not found", font=f_h1, fill=(234, 240, 255, 255))
-        d.text((content_x, content_y + 70), "This link may have expired on the demo server.", font=f_body, fill=(168, 179, 214, 255))
-    else:
-        s = score if isinstance(score, int) else 0
-        b = band or "Uncertain"
-        col = _band_color(b)
-
-        d.text((content_x, content_y), "Confidence", font=f_body, fill=(168, 179, 214, 255))
-        d.text((content_x, content_y + 40), f"{s}", font=f_big, fill=(234, 240, 255, 255))
-
-        chip_x = content_x + 170
-        chip_y = content_y + 66
-        chip_w, chip_h = 260, 54
-        d.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h],
-                            radius=26,
-                            fill=(col[0], col[1], col[2], 60),
-                            outline=(col[0], col[1], col[2], 180),
-                            width=2)
-        d.text((chip_x + 18, chip_y + 12), b, font=f_band, fill=(234, 240, 255, 255))
-
-        d.line([content_x, content_y + 150, card_x + card_w - 38, content_y + 150],
-               fill=(255, 255, 255, 35), width=2)
-
-        summ = _truncate(summary or "Probabilistic analysis based on available signals.", 160)
-        d.text((content_x, content_y + 175), summ, font=f_body, fill=(234, 240, 255, 255))
-
-        dom = (domain or "").strip()
-        if dom:
-            d.text((content_x, content_y + 235), f"Domain: {dom}", font=f_small, fill=(168, 179, 214, 255))
-
-    d.text((content_x, card_y + card_h - 48), f"veriscan • report id {scan_id[:8]}",
-           font=f_small, fill=(168, 179, 214, 255))
-
-    out = io.BytesIO()
-    img.convert("RGB").save(out, format="PNG", optimize=True)
-    out.seek(0)
-    return StreamingResponse(out, media_type="image/png")
-
-
-# -------------------------
-# Share page
+# Minimal share page (keeps your existing static/index UI)
 # -------------------------
 
 def _html_escape(s: str) -> str:
@@ -1256,208 +1284,121 @@ def _html_escape(s: str) -> str:
 
 @app.get("/result/{scan_id}", response_class=HTMLResponse)
 def result_page(scan_id: str, request: Request):
-    item = db_get_scan(scan_id)
-    status = (item or {}).get("status", "not_found")
-
     base = str(request.base_url).rstrip("/")
     og_url = f"{base}/result/{scan_id}"
-    og_img = f"{base}/og/{scan_id}.png"
-
     og_title = "VeriScan Report"
     og_desc = "Scan. Analyze. Decide. — Clarity in a world of noise."
-    og_type = "website"
 
-    if status == "complete" and item:
-        report = item.get("report") or {}
-        score = report.get("overall_score")
-        band = report.get("band_label")
-        summary = (report.get("summary_text") or "").strip()
-        if isinstance(score, int) and band:
-            og_title = f"VeriScan Report — {score}/100 • {band}"
-        if summary:
-            og_desc = summary[:180]
-
-    html = """
+    html = f"""
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>__OG_TITLE__</title>
-
-<meta property="og:title" content="__OG_TITLE__" />
-<meta property="og:description" content="__OG_DESC__" />
-<meta property="og:type" content="__OG_TYPE__" />
-<meta property="og:url" content="__OG_URL__" />
-<meta property="og:image" content="__OG_IMG__" />
+<title>{_html_escape(og_title)}</title>
+<meta property="og:title" content="{_html_escape(og_title)}" />
+<meta property="og:description" content="{_html_escape(og_desc)}" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="{_html_escape(og_url)}" />
 
 <style>
-body { font-family: Arial, sans-serif; background:#0b1020; color:#eaf0ff; margin:0; padding:40px; }
-.card { background:#111933; padding:24px; border-radius:16px; max-width:950px; margin:auto; border:1px solid rgba(255,255,255,.12); }
-.muted { opacity:.75; }
-.score { font-size:42px; font-weight:800; margin-top:10px; }
-.band { font-size:18px; opacity:.8; }
-.section { margin-top:22px; padding-top:14px; border-top:1px solid rgba(255,255,255,.12); }
-ul { margin-top:8px; }
-button { padding:10px 14px; border-radius:10px; border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.08); color:#eaf0ff; cursor:pointer; }
-button:hover { background:rgba(255,255,255,.12); }
-code { background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; }
-pre { background:rgba(0,0,0,.25); padding:12px; border-radius:12px; overflow:auto; }
-a { color:#b9ccff; text-decoration:none; }
-a:hover { text-decoration:underline; }
-.badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; background:rgba(255,255,255,.09); border:1px solid rgba(255,255,255,.12); margin-right:8px; }
-.tagTrusted { background: rgba(60,220,150,.16); border-color: rgba(60,220,150,.25); }
-.tagOther { background: rgba(255,210,90,.14); border-color: rgba(255,210,90,.22); }
+body {{ font-family: Arial, sans-serif; background:#0b1020; color:#eaf0ff; margin:0; padding:40px; }}
+.card {{ background:#111933; padding:24px; border-radius:16px; max-width:980px; margin:auto; border:1px solid rgba(255,255,255,.12); }}
+.muted {{ opacity:.75; }}
+.section {{ margin-top:22px; padding-top:14px; border-top:1px solid rgba(255,255,255,.12); }}
+code {{ background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; }}
+a {{ color:#b9ccff; text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+.badge {{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; background:rgba(255,255,255,.09); border:1px solid rgba(255,255,255,.12); margin-right:8px; }}
+.tagTrusted {{ background: rgba(60,220,150,.16); border-color: rgba(60,220,150,.25); }}
+.tagOther {{ background: rgba(255,210,90,.14); border-color: rgba(255,210,90,.22); }}
 </style>
 </head>
 <body>
-
 <div class="card">
   <h1 style="margin:0;">VeriScan Report</h1>
-  <div class="muted">Scan ID: <code>__SCAN_ID__</code></div>
-
+  <div class="muted">Scan ID: <code>{_html_escape(scan_id)}</code></div>
   <div id="content" style="margin-top:16px;">Loading...</div>
-
-  <div style="margin-top:20px;">
-    <button onclick="copyLink()">Copy Link</button>
-  </div>
 </div>
 
 <script>
-const scanId = __SCAN_ID_JSON__;
+const scanId = {json.dumps(scan_id)};
 
-function esc(s){
+function esc(s){{
   return String(s || "")
     .replaceAll("&","&amp;")
     .replaceAll("<","&lt;")
     .replaceAll(">","&gt;");
-}
+}}
 
-function copyLink() {
-  navigator.clipboard.writeText(window.location.href);
-}
-
-function renderEvidence(list){
-  if (!list || list.length === 0) {
+function renderEvidence(list){{
+  if (!list || list.length === 0) {{
     return "<div class='muted'>No corroboration links available.</div>";
-  }
-  return "<div style='margin-top:10px; display:flex; flex-direction:column; gap:10px;'>" + list.map(e => {
+  }}
+  return "<div style='margin-top:10px; display:flex; flex-direction:column; gap:10px;'>" + list.map(e => {{
     const tag = e.trusted ? "<span class='badge tagTrusted'>Trusted</span>" : "<span class='badge tagOther'>Other outlet</span>";
     const title = esc(e.title || e.domain || e.url);
     const dom = esc(e.domain || "");
     const url = esc(e.url || "");
+    const rf = e.resolved_from ? `<div class="muted" style="margin-top:4px;">Resolved from: <code>${{esc(e.resolved_from)}}</code></div>` : "";
     return `
       <div style="padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,.12); background:rgba(0,0,0,.20);">
-        <div>${tag}<span class="muted">${dom}</span></div>
-        <div style="margin-top:6px; font-weight:700;"><a href="${url}" target="_blank" rel="noreferrer">${title}</a></div>
+        <div>${{tag}}<span class="muted">${{dom}}</span></div>
+        <div style="margin-top:6px; font-weight:700;"><a href="${{url}}" target="_blank" rel="noreferrer">${{title}}</a></div>
+        ${{rf}}
       </div>
     `;
-  }).join("") + "</div>";
-}
+  }}).join("") + "</div>";
+}}
 
-async function load() {
+async function load(){{
   const res = await fetch("/api/v1/scan/" + scanId);
   const data = await res.json();
-
-  if (data.status !== "complete") {
-    document.getElementById("content").innerHTML =
-      "<div><b>Status:</b> " + esc(data.status) + "</div>";
+  if (data.status !== "complete"){{
+    document.getElementById("content").innerHTML = "<div><b>Status:</b> " + esc(data.status) + "</div>";
     return;
-  }
+  }}
 
-  const r = data.report || {};
-  const sig = (r.evidence && r.evidence.signals) ? r.evidence.signals : {};
-
-  let explainHTML = "";
-  if (r.explain) {
-    const h = r.explain.highlights || [];
-    const c = r.explain.concerns || [];
-    const m = r.explain.missing || [];
-    const g = r.explain.guidance || "";
-
-    const list = (arr) => arr.length ? "<ul>" + arr.map(x => "<li>"+esc(x)+"</li>").join("") + "</ul>"
-                                    : "<div class='muted'>None</div>";
-
-    explainHTML = `
-      <div class="section">
-        <h3 style="margin:0 0 8px;">Explain This Score</h3>
-        <b>What helped</b>
-        ${list(h)}
-        <b>What raised concern</b>
-        ${list(c)}
-        <b>What we couldn’t verify</b>
-        ${list(m)}
-        <div class="muted" style="margin-top:10px;">${esc(g)}</div>
-      </div>
-    `;
-  }
-
-  const qs = sig.corroboration_queries || [];
-  const qLine = qs.length ? qs.map(esc).join(" • ") : "—";
-
-  const engine = sig.corroboration_engine || "—";
-  const debug = sig.corroboration_debug || {};
-  const allHits = debug.all_outlets_hits;
-  const allSample = debug.all_outlets_sample || [];
+  const r = data.report || {{}};
+  const sig = (r.evidence && r.evidence.signals) ? r.evidence.signals : {{}};
+  const debug = sig.corroboration_debug || {{}};
   const evidenceLinks = sig.corroboration_evidence || [];
 
   document.getElementById("content").innerHTML = `
-    <div class="score">${r.overall_score}/100</div>
-    <div class="band">${esc(r.band_label)}</div>
+    <div style="font-size:44px; font-weight:800;">${{r.overall_score}}/100</div>
+    <div class="muted" style="margin-top:2px;">${{esc(r.band_label)}}</div>
 
     <div class="section">
-      <b>Summary:</b>
-      <div style="margin-top:6px;">${esc(r.summary_text)}</div>
+      <b>Summary</b>
+      <div style="margin-top:6px;">${{esc(r.summary_text)}}</div>
     </div>
 
     <div class="section">
-      <b>Corroboration:</b>
-      <div style="margin-top:6px;">
-        Engine: <code>${esc(engine)}</code>
-        &nbsp; Trusted hits: <code>${esc(String(sig.corroboration_hits ?? "unavailable"))}</code>
-        &nbsp; Trusted domains: <code>${esc((sig.corroboration_domains || []).join(", ") || "—")}</code>
+      <b>Corroboration</b>
+      <div style="margin-top:8px;">
+        Trusted hits: <code>${{esc(String(sig.corroboration_hits ?? "unavailable"))}}</code>
+        &nbsp; Trusted domains: <code>${{esc((sig.corroboration_domains || []).join(", ") || "—")}}</code>
       </div>
 
       <div class="muted" style="margin-top:10px;">
-        All outlets found (unique domains): <code>${esc(String(allHits ?? "—"))}</code>
+        Syndication resolved: <code>${{esc(String(debug.syndication_resolved ?? "0"))}}</code> /
+        attempted <code>${{esc(String(debug.syndication_attempted ?? "0"))}}</code>
       </div>
 
-      ${allSample.length ? `
-        <div class="muted" style="margin-top:8px;">Sample outlets:</div>
-        <div style="margin-top:6px;"><code>${esc(allSample.join(", "))}</code></div>
-      ` : ""}
-
-      <div class="muted" style="margin-top:8px;">Claim query used: <code>${qLine}</code></div>
-
       <h3 style="margin:18px 0 6px;">Corroboration Evidence</h3>
-      ${renderEvidence(evidenceLinks)}
+      ${{renderEvidence(evidenceLinks)}}
 
       <details style="margin-top:14px;">
         <summary class="muted">Debug</summary>
-        <pre>${esc(JSON.stringify(debug, null, 2))}</pre>
+        <pre style="background:rgba(0,0,0,.25); padding:12px; border-radius:12px; overflow:auto;">${{esc(JSON.stringify(debug, null, 2))}}</pre>
       </details>
     </div>
-
-    ${explainHTML}
   `;
-}
+}}
 
 load();
 </script>
-
 </body>
 </html>
 """
-
-    html = (
-        html
-        .replace("__OG_TITLE__", _html_escape(og_title))
-        .replace("__OG_DESC__", _html_escape(og_desc))
-        .replace("__OG_TYPE__", _html_escape(og_type))
-        .replace("__OG_URL__", _html_escape(og_url))
-        .replace("__OG_IMG__", _html_escape(og_img))
-        .replace("__SCAN_ID__", _html_escape(scan_id))
-        .replace("__SCAN_ID_JSON__", json.dumps(scan_id))
-    )
-
     return HTMLResponse(html)
