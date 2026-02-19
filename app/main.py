@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, quote_plus
 from datetime import datetime, timezone
@@ -7,7 +7,6 @@ import uuid
 import asyncio
 import re
 import json
-import io
 import os
 import xml.etree.ElementTree as ET
 
@@ -15,7 +14,7 @@ import httpx
 from bs4 import BeautifulSoup
 import tldextract
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import imagehash
 import piexif
 
@@ -34,7 +33,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v7_4-syndication-unmask-debug-2026-02-19"
+APP_VERSION = "veriscan-corroboration-v7_5-syndication-filterfix-2026-02-19"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -428,16 +427,29 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 
 # -------------------------
-# Corroboration: Bing News RSS with Evidence Links — V7.4
-# Better syndication unmasking + debug
+# Corroboration: Bing News RSS + Evidence Links — V7.5
+# Fix: filter out ad/analytics URLs so MSN doesn't "resolve" to adsdk.microsoft.com/ast.js
 # -------------------------
 
 SYNDICATION_HOSTS = {"msn.com", "yahoo.com", "aol.com"}
 
+# Prefer these keys (publisher-ish) BEFORE generic "url"
 SYNDICATION_URL_KEYS = [
-    "originalUrl", "originalURL", "sourceUrl", "sourceURL",
-    "providerUrl", "providerURL", "canonicalUrl", "canonicalURL",
-    "contentUrl", "contentURL", "url"
+    "originalUrl", "originalURL",
+    "sourceUrl", "sourceURL",
+    "providerUrl", "providerURL",
+    "canonicalUrl", "canonicalURL",
+    "contentUrl", "contentURL",
+    "mainEntityOfPage",
+    "entityUrl",
+    "articleUrl",
+]
+
+# Never accept these domains/keywords as a "publisher"
+BAD_URL_SUBSTRINGS = [
+    "adsdk.", "doubleclick.", "googlesyndication.", "google-analytics", "analytics.",
+    "adservice.", "/ads/", "adserver", "ast.js", ".js?", ".css?", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".webp", ".ico", "/ast/ast.js"
 ]
 
 
@@ -530,13 +542,43 @@ def _abs_url(base_url: str, maybe_url: str) -> str:
     return maybe_url
 
 
+def _looks_like_real_article_url(u: str) -> bool:
+    if not u or not u.startswith(("http://", "https://")):
+        return False
+    ul = u.lower()
+
+    # filter obvious junk (ads/scripts/images)
+    for bad in BAD_URL_SUBSTRINGS:
+        if bad in ul:
+            return False
+
+    # block common static file endings
+    if re.search(r"\.(js|css|png|jpg|jpeg|gif|svg|webp|ico)(\?|$)", ul):
+        return False
+
+    # must have a domain + path
+    d = normalize_domain(parse_domain(u) or "")
+    if not d:
+        return False
+
+    # avoid microsoft ads host
+    if d == "microsoft.com" and ("adsdk" in ul or "ast.js" in ul):
+        return False
+
+    return True
+
+
 def _extract_urls_from_inline_json(html: str) -> list[str]:
+    """
+    Extract candidate URLs from inline JSON-like blobs.
+    IMPORTANT: return in an order that prefers publisher-like URLs.
+    """
     if not html:
         return []
 
     urls = []
 
-    # Key-based extraction: "originalUrl":"https://..."
+    # Key-based extraction
     for key in SYNDICATION_URL_KEYS:
         pattern = rf'"{re.escape(key)}"\s*:\s*"([^"]+)"'
         for m in re.finditer(pattern, html):
@@ -544,12 +586,13 @@ def _extract_urls_from_inline_json(html: str) -> list[str]:
             if u.startswith(("http://", "https://")):
                 urls.append(u)
 
-    # Catch any escaped https:\/\/... that might be embedded in scripts
+    # Catch escaped https:\/\/... (append later; noisier)
     for m in re.finditer(r'(https?:\\?/\\?/[^"\s<]+)', html):
         u = m.group(1).replace("\\/", "/").strip()
         if u.startswith(("http://", "https://")):
             urls.append(u)
 
+    # Dedup keep order
     seen = set()
     out = []
     for u in urls:
@@ -560,16 +603,36 @@ def _extract_urls_from_inline_json(html: str) -> list[str]:
 
 
 def _pick_best_publisher_url(candidates: list[str], synd_domain: str) -> str:
+    """
+    Choose a candidate that:
+    - is not syndication host
+    - is not Bing
+    - looks like a real article URL (not adsdk/microsoft scripts)
+    Preference order:
+      1) Trusted domains
+      2) Anything that looks like article URL
+    """
     synd_domain = normalize_domain(synd_domain)
+
+    # 1) Trusted domain candidates first
     for u in candidates:
+        if not _looks_like_real_article_url(u):
+            continue
         d = normalize_domain(parse_domain(u) or "")
-        if not d:
+        if not d or d in SYNDICATION_HOSTS or d == synd_domain or "bing.com" in d:
             continue
-        if d == synd_domain or d in SYNDICATION_HOSTS:
+        if _is_trusted_domain(d):
+            return u
+
+    # 2) Any plausible article URL
+    for u in candidates:
+        if not _looks_like_real_article_url(u):
             continue
-        if "bing.com" in d:
+        d = normalize_domain(parse_domain(u) or "")
+        if not d or d in SYNDICATION_HOSTS or d == synd_domain or "bing.com" in d:
             continue
         return u
+
     return ""
 
 
@@ -578,19 +641,27 @@ def _extract_best_publisher_url(html: str, fetched_url: str) -> str:
 
     canon = soup.find("link", rel=lambda x: x and "canonical" in x.lower())
     if canon and canon.get("href"):
-        return _abs_url(fetched_url, canon["href"].strip())
+        u = _abs_url(fetched_url, canon["href"].strip())
+        if _looks_like_real_article_url(u):
+            return u
 
     og = soup.find("meta", attrs={"property": "og:url"})
     if og and og.get("content"):
-        return og["content"].strip()
+        u = og["content"].strip()
+        if _looks_like_real_article_url(u):
+            return u
 
     tw = soup.find("meta", attrs={"name": "twitter:url"})
     if tw and tw.get("content"):
-        return tw["content"].strip()
+        u = tw["content"].strip()
+        if _looks_like_real_article_url(u):
+            return u
 
     pl = soup.find("meta", attrs={"name": "parsely-link"})
     if pl and pl.get("content"):
-        return pl["content"].strip()
+        u = pl["content"].strip()
+        if _looks_like_real_article_url(u):
+            return u
 
     # JSON-LD
     for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
@@ -610,12 +681,12 @@ def _extract_best_publisher_url(html: str, fetched_url: str) -> str:
             if isinstance(obj, dict):
                 t = obj.get("@type")
                 if isinstance(t, str) and ("NewsArticle" in t or t.lower() == "article"):
-                    if isinstance(obj.get("url"), str) and obj["url"].startswith(("http://", "https://")):
+                    if isinstance(obj.get("url"), str) and _looks_like_real_article_url(obj["url"]):
                         return obj["url"].strip()
                     me = obj.get("mainEntityOfPage")
-                    if isinstance(me, dict) and isinstance(me.get("@id"), str) and me["@id"].startswith(("http://", "https://")):
+                    if isinstance(me, dict) and isinstance(me.get("@id"), str) and _looks_like_real_article_url(me["@id"]):
                         return me["@id"].strip()
-                    if isinstance(me, str) and me.startswith(("http://", "https://")):
+                    if isinstance(me, str) and _looks_like_real_article_url(me):
                         return me.strip()
                 for v in obj.values():
                     if isinstance(v, (dict, list)):
@@ -644,37 +715,47 @@ async def _unmask_syndication(url: str, client: httpx.AsyncClient) -> tuple[str,
         "status_code": None,
         "final_url": None,
         "extracted_url": None,
+        "note": None,
     }
 
     if dom not in SYNDICATION_HOSTS:
+        debug["note"] = "Not a syndication host"
         return ("", "", debug)
 
     try:
         r = await client.get(url)
     except Exception as e:
         debug["error"] = str(e)
+        debug["note"] = "Fetch error"
         return ("", "", debug)
 
     debug["status_code"] = r.status_code
     debug["final_url"] = str(r.url)
 
+    # Yahoo often rate limits on hosted IPs
+    if r.status_code == 429:
+        debug["note"] = "Rate limited (429); skipping unmask"
+        return ("", "", debug)
+
     if r.status_code >= 400:
+        debug["note"] = "Blocked or error (>=400)"
         return ("", "", debug)
 
     html = r.text or ""
     best = _extract_best_publisher_url(html, debug["final_url"])
     debug["extracted_url"] = best or None
 
-    if not best:
-        fd = normalize_domain(parse_domain(debug["final_url"]) or "")
-        if fd and fd not in SYNDICATION_HOSTS:
-            return (debug["final_url"], fd, debug)
+    # Only accept if it looks like a real article URL
+    if not best or not _looks_like_real_article_url(best):
+        debug["note"] = "No valid publisher URL found"
         return ("", "", debug)
 
     pd = normalize_domain(parse_domain(best) or "")
     if not pd or pd in SYNDICATION_HOSTS:
+        debug["note"] = "Extracted URL not usable (missing domain or still syndication)"
         return ("", "", debug)
 
+    debug["note"] = "Resolved"
     return (best, pd, debug)
 
 
@@ -737,7 +818,7 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             "resolved_from": None,
         })
 
-    # --- Syndication unmasking (MSN/Yahoo/AOL) with debug ---
+    # --- Syndication unmasking (MSN/Yahoo/AOL) with safe filtering ---
     MAX_SYNDICATION_RESOLVE = 6
     synd_targets = [e for e in evidence if e["domain"] in SYNDICATION_HOSTS][:MAX_SYNDICATION_RESOLVE]
 
@@ -757,7 +838,8 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
                 for e in synd_targets:
                     pub_url, pub_dom, dbg = await _unmask_syndication(e["url"], client2)
                     synd_debug.append(dbg)
-                    if pub_url and pub_dom:
+                    # only apply mapping if it's real (not scripts/ads)
+                    if pub_url and pub_dom and _looks_like_real_article_url(pub_url):
                         synd_map[e["url"]] = (pub_url, pub_dom)
                         synd_ok += 1
         except Exception as e:
@@ -823,7 +905,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v7_4::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7_5::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -1114,82 +1196,32 @@ def build_explanation(report: dict) -> dict:
     concerns = []
     missing_items = []
 
-    is_link = ("final_url" in signals) or ("domain" in signals) or ("https" in signals)
-    is_image = ("phash" in signals) or ("width" in signals) or ("exif_present" in signals)
-
     hits = signals.get("corroboration_hits")
     if isinstance(hits, int):
         if hits >= 3:
             highlights.append(f"Multiple trusted sources appear to cover similar facts ({hits} matched trusted domain(s)).")
         elif hits in (1, 2):
             highlights.append(f"Some trusted corroboration exists ({hits} matched trusted domain(s)).")
-        elif hits == 0 and is_link:
+        elif hits == 0:
             concerns.append("No matches were found on the trusted corroboration list (not proof of falsehood, but less support).")
-    else:
-        if is_link:
-            missing_items.append("Trusted corroboration check was unavailable.")
 
     age_days = signals.get("domain_age_days")
-    if age_days is None and is_link:
-        missing_items.append("Domain age could not be determined.")
-    elif isinstance(age_days, int):
-        if age_days >= 3650:
-            highlights.append("The domain is long-established (older domains are harder to spoof at scale).")
-        elif age_days < 180:
-            concerns.append("The domain is relatively new (new domains are more commonly used for spam/misinformation).")
+    if isinstance(age_days, int) and age_days >= 3650:
+        highlights.append("The domain is long-established (older domains are harder to spoof at scale).")
 
-    https = signals.get("https")
-    if https is True and is_link:
+    if signals.get("https") is True:
         highlights.append("The link uses HTTPS (basic transport security).")
-    elif https is False and is_link:
-        concerns.append("The link is not using HTTPS (higher risk).")
 
-    if signals.get("blocked") is True and is_link:
-        concerns.append("The site blocked automated access; analysis relied more on domain-level signals.")
-    elif is_link and signals.get("title"):
+    if signals.get("title"):
         highlights.append("Page title/content signals were available for analysis.")
 
     out = signals.get("outbound_links_count")
-    if isinstance(out, int) and is_link and signals.get("blocked") is False:
-        if out >= 15:
-            highlights.append("The page links out to multiple references (a weak proxy for citations).")
-        elif out <= 1:
-            concerns.append("Few or no outbound links were detected (less transparent sourcing).")
-
-    if is_image:
-        exif_present = signals.get("exif_present")
-        if exif_present is True:
-            highlights.append("The image contains EXIF metadata (can help with provenance, though it can be edited).")
-        elif exif_present is False:
-            concerns.append("The image has no EXIF metadata (common after re-uploads/edits; reduces provenance clues).")
-
-        if signals.get("exif_software"):
-            concerns.append("Editing software is listed in metadata (could be normal, but can indicate manipulation).")
+    if isinstance(out, int) and out >= 15:
+        highlights.append("The page links out to multiple references (a weak proxy for citations).")
 
     for m in missing:
         if m == "AI_MANIPULATION":
             missing_items.append("AI/manipulation classification is not enabled in this demo.")
-        elif m == "REVERSE_IMAGE":
-            missing_items.append("Reverse image search is not enabled in this demo.")
-        elif m == "CROSS_VERIFICATION":
-            missing_items.append("Cross-verification was not available for this scan.")
-        elif m == "DOMAIN_AGE":
-            missing_items.append("Domain age lookup was unavailable.")
-        else:
-            missing_items.append(m.replace("_", " ").title())
-
-    def uniq(xs):
-        seen = set()
-        out2 = []
-        for x in xs:
-            if x not in seen:
-                seen.add(x)
-                out2.append(x)
-        return out2
-
-    highlights = uniq(highlights)
-    concerns = uniq(concerns)
-    missing_items = uniq(missing_items)
 
     guidance = (
         "Treat this as a confidence signal, not a verdict. "
@@ -1197,9 +1229,9 @@ def build_explanation(report: dict) -> dict:
     )
 
     return {
-        "highlights": highlights,
-        "concerns": concerns,
-        "missing": missing_items,
+        "highlights": list(dict.fromkeys(highlights)),
+        "concerns": list(dict.fromkeys(concerns)),
+        "missing": list(dict.fromkeys(missing_items)),
         "guidance": guidance,
     }
 
@@ -1298,16 +1330,8 @@ def get_scan(scan_id: str):
     if item["status"] == "complete":
         report = item.get("report") or {}
         if not report.get("explain"):
-            try:
-                report["explain"] = build_explanation(report)
-                db_upsert_scan(scan_id, "complete", report=report)
-            except Exception:
-                report["explain"] = {
-                    "highlights": [],
-                    "concerns": [],
-                    "missing": ["Explanation engine failed unexpectedly."],
-                    "guidance": "Try rerunning the scan."
-                }
+            report["explain"] = build_explanation(report)
+            db_upsert_scan(scan_id, "complete", report=report)
         resp["report"] = report
 
     if item.get("error"):
@@ -1342,7 +1366,6 @@ def result_page(scan_id: str, request: Request):
 <meta property="og:description" content="{_html_escape(og_desc)}" />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="{_html_escape(og_url)}" />
-
 <style>
 body {{ font-family: Arial, sans-serif; background:#0b1020; color:#eaf0ff; margin:0; padding:40px; }}
 .card {{ background:#111933; padding:24px; border-radius:16px; max-width:980px; margin:auto; border:1px solid rgba(255,255,255,.12); }}
