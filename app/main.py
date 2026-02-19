@@ -34,7 +34,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v7_3-syndication-unmask-2026-02-19"
+APP_VERSION = "veriscan-corroboration-v7_4-syndication-unmask-debug-2026-02-19"
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -428,11 +428,17 @@ def build_corroboration_queries(title: str, domain: str | None) -> list[str]:
 
 
 # -------------------------
-# Corroboration: Bing News RSS with Evidence Links — V7.3
-# Adds syndication unmasking for MSN/Yahoo/AOL
+# Corroboration: Bing News RSS with Evidence Links — V7.4
+# Better syndication unmasking + debug
 # -------------------------
 
 SYNDICATION_HOSTS = {"msn.com", "yahoo.com", "aol.com"}
+
+SYNDICATION_URL_KEYS = [
+    "originalUrl", "originalURL", "sourceUrl", "sourceURL",
+    "providerUrl", "providerURL", "canonicalUrl", "canonicalURL",
+    "contentUrl", "contentURL", "url"
+]
 
 
 def _unwrap_bing_news_link(u: str) -> str:
@@ -477,9 +483,6 @@ async def _resolve_final_url(u: str) -> str:
 
 
 def _parse_rss_items(xml_text: str) -> list[dict]:
-    """
-    Returns list of items: {title, link}
-    """
     out = []
     try:
         root = ET.fromstring(xml_text)
@@ -516,7 +519,6 @@ def _abs_url(base_url: str, maybe_url: str) -> str:
         return ""
     if maybe_url.startswith("http://") or maybe_url.startswith("https://"):
         return maybe_url
-    # very small join fallback
     try:
         b = urlparse(base_url)
         if maybe_url.startswith("//"):
@@ -528,25 +530,64 @@ def _abs_url(base_url: str, maybe_url: str) -> str:
     return maybe_url
 
 
+def _extract_urls_from_inline_json(html: str) -> list[str]:
+    if not html:
+        return []
+
+    urls = []
+
+    # Key-based extraction: "originalUrl":"https://..."
+    for key in SYNDICATION_URL_KEYS:
+        pattern = rf'"{re.escape(key)}"\s*:\s*"([^"]+)"'
+        for m in re.finditer(pattern, html):
+            u = m.group(1).replace("\\/", "/").strip()
+            if u.startswith(("http://", "https://")):
+                urls.append(u)
+
+    # Catch any escaped https:\/\/... that might be embedded in scripts
+    for m in re.finditer(r'(https?:\\?/\\?/[^"\s<]+)', html):
+        u = m.group(1).replace("\\/", "/").strip()
+        if u.startswith(("http://", "https://")):
+            urls.append(u)
+
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _pick_best_publisher_url(candidates: list[str], synd_domain: str) -> str:
+    synd_domain = normalize_domain(synd_domain)
+    for u in candidates:
+        d = normalize_domain(parse_domain(u) or "")
+        if not d:
+            continue
+        if d == synd_domain or d in SYNDICATION_HOSTS:
+            continue
+        if "bing.com" in d:
+            continue
+        return u
+    return ""
+
+
 def _extract_best_publisher_url(html: str, fetched_url: str) -> str:
-    """
-    Try to find the original publisher URL from a syndication page.
-    Order:
-      canonical -> og:url -> parsely-link -> JSON-LD NewsArticle.url/mainEntityOfPage -> regex for originalUrl
-    """
     soup = BeautifulSoup(html or "", "html.parser")
 
-    # canonical
     canon = soup.find("link", rel=lambda x: x and "canonical" in x.lower())
     if canon and canon.get("href"):
         return _abs_url(fetched_url, canon["href"].strip())
 
-    # og:url
     og = soup.find("meta", attrs={"property": "og:url"})
     if og and og.get("content"):
         return og["content"].strip()
 
-    # parsely-link
+    tw = soup.find("meta", attrs={"name": "twitter:url"})
+    if tw and tw.get("content"):
+        return tw["content"].strip()
+
     pl = soup.find("meta", attrs={"name": "parsely-link"})
     if pl and pl.get("content"):
         return pl["content"].strip()
@@ -563,21 +604,19 @@ def _extract_best_publisher_url(html: str, fetched_url: str) -> str:
         except Exception:
             continue
 
-        candidates = []
         stack = [data] if isinstance(data, (dict, list)) else []
         while stack:
             obj = stack.pop()
             if isinstance(obj, dict):
                 t = obj.get("@type")
                 if isinstance(t, str) and ("NewsArticle" in t or t.lower() == "article"):
-                    for key in ("url",):
-                        if obj.get(key) and isinstance(obj.get(key), str):
-                            candidates.append(obj.get(key))
+                    if isinstance(obj.get("url"), str) and obj["url"].startswith(("http://", "https://")):
+                        return obj["url"].strip()
                     me = obj.get("mainEntityOfPage")
-                    if isinstance(me, dict) and isinstance(me.get("@id"), str):
-                        candidates.append(me.get("@id"))
-                    if isinstance(me, str):
-                        candidates.append(me)
+                    if isinstance(me, dict) and isinstance(me.get("@id"), str) and me["@id"].startswith(("http://", "https://")):
+                        return me["@id"].strip()
+                    if isinstance(me, str) and me.startswith(("http://", "https://")):
+                        return me.strip()
                 for v in obj.values():
                     if isinstance(v, (dict, list)):
                         stack.append(v)
@@ -586,53 +625,57 @@ def _extract_best_publisher_url(html: str, fetched_url: str) -> str:
                     if isinstance(v, (dict, list)):
                         stack.append(v)
 
-        for c in candidates:
-            if c and isinstance(c, str) and (c.startswith("http://") or c.startswith("https://")):
-                return c.strip()
-
-    # regex fallback: originalUrl":"https://....
-    m = re.search(r'originalUrl"\s*:\s*"([^"]+)"', html or "")
-    if m:
-        return m.group(1).replace("\\/", "/").strip()
+    # Inline JSON candidates (best for MSN/Yahoo/AOL)
+    inline_candidates = _extract_urls_from_inline_json(html or "")
+    synd_dom = normalize_domain(parse_domain(fetched_url) or "")
+    best = _pick_best_publisher_url(inline_candidates, synd_dom)
+    if best:
+        return best
 
     return ""
 
 
-async def _unmask_syndication(url: str, client: httpx.AsyncClient) -> tuple[str, str] | None:
-    """
-    If url is on msn/yahoo/aol, fetch page and extract the true publisher URL+domain.
-    Returns (publisher_url, publisher_domain) or None.
-    """
+async def _unmask_syndication(url: str, client: httpx.AsyncClient) -> tuple[str, str, dict]:
     dom = normalize_domain(parse_domain(url) or "")
+
+    debug = {
+        "synd_url": url,
+        "synd_domain": dom,
+        "status_code": None,
+        "final_url": None,
+        "extracted_url": None,
+    }
+
     if dom not in SYNDICATION_HOSTS:
-        return None
+        return ("", "", debug)
 
     try:
         r = await client.get(url)
-    except Exception:
-        return None
+    except Exception as e:
+        debug["error"] = str(e)
+        return ("", "", debug)
+
+    debug["status_code"] = r.status_code
+    debug["final_url"] = str(r.url)
 
     if r.status_code >= 400:
-        return None
+        return ("", "", debug)
 
-    final_url = str(r.url)
     html = r.text or ""
+    best = _extract_best_publisher_url(html, debug["final_url"])
+    debug["extracted_url"] = best or None
 
-    best = _extract_best_publisher_url(html, final_url)
     if not best:
-        # fallback: if final_url changed to a non-syndication domain, use that
-        fd = normalize_domain(parse_domain(final_url) or "")
+        fd = normalize_domain(parse_domain(debug["final_url"]) or "")
         if fd and fd not in SYNDICATION_HOSTS:
-            return (final_url, fd)
-        return None
+            return (debug["final_url"], fd, debug)
+        return ("", "", debug)
 
     pd = normalize_domain(parse_domain(best) or "")
-    if not pd:
-        return None
-    if pd in SYNDICATION_HOSTS:
-        return None
+    if not pd or pd in SYNDICATION_HOSTS:
+        return ("", "", debug)
 
-    return (best, pd)
+    return (best, pd, debug)
 
 
 async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: str | None) -> dict:
@@ -657,13 +700,12 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
 
     items = _parse_rss_items(xml_text)
 
-    # Unwrap Bing links
     unwrapped = []
     for it in items:
         u = _unwrap_bing_news_link(it["link"])
         unwrapped.append({"title": it.get("title", ""), "link": u})
 
-    # Resolve remaining bing.com redirects (cap)
+    # Resolve bing.com redirects (cap)
     N_RESOLVE_BING = 12
     resolved_bing = 0
     for it in unwrapped:
@@ -672,7 +714,7 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             it["link"] = await _resolve_final_url(it["link"])
             resolved_bing += 1
 
-    # Build evidence items (initial)
+    # Build evidence items
     evidence = []
     seen_links = set()
     for it in unwrapped:
@@ -692,14 +734,15 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             "domain": dom,
             "url": link,
             "trusted": False,
-            "resolved_from": None,   # for syndication trace
+            "resolved_from": None,
         })
 
-    # --- Syndication unmasking (MSN/Yahoo/AOL) ---
+    # --- Syndication unmasking (MSN/Yahoo/AOL) with debug ---
     MAX_SYNDICATION_RESOLVE = 6
     synd_targets = [e for e in evidence if e["domain"] in SYNDICATION_HOSTS][:MAX_SYNDICATION_RESOLVE]
 
-    synd_map = {}  # original_url -> (publisher_url, publisher_domain)
+    synd_map = {}      # original_url -> (publisher_url, publisher_domain)
+    synd_debug = []    # per-link debug
     synd_ok = 0
 
     if synd_targets:
@@ -707,18 +750,18 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.bing.com/",
         }
         try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers2) as client2:
-                # resolve sequentially to reduce risk of blocks
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers2) as client2:
                 for e in synd_targets:
-                    res = await _unmask_syndication(e["url"], client2)
-                    if res:
-                        pub_url, pub_dom = res
+                    pub_url, pub_dom, dbg = await _unmask_syndication(e["url"], client2)
+                    synd_debug.append(dbg)
+                    if pub_url and pub_dom:
                         synd_map[e["url"]] = (pub_url, pub_dom)
                         synd_ok += 1
-        except Exception:
-            pass
+        except Exception as e:
+            synd_debug.append({"error": str(e)})
 
     # Apply syndication mapping
     for e in evidence:
@@ -730,15 +773,16 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             e["domain"] = pub_dom
             e["url"] = pub_url
 
-    # Now compute trusted + outlets
+    # Unique outlets
     all_domains = [e["domain"] for e in evidence]
-    seen = set()
     uniq_outlets = []
+    seen = set()
     for d in all_domains:
         if d not in seen:
             seen.add(d)
             uniq_outlets.append(d)
 
+    # Trusted hits
     trusted_domains_found = set()
     for e in evidence:
         tm = _is_trusted_domain(e["domain"])
@@ -746,7 +790,7 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             e["trusted"] = True
             trusted_domains_found.add(tm)
 
-    # Sort evidence: trusted first, then by domain
+    # Sort evidence: trusted first
     evidence_sorted = sorted(
         evidence,
         key=lambda x: (0 if x["trusted"] else 1, x["domain"], -len(x.get("title") or "")),
@@ -762,9 +806,7 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
         "resolved_bing_count": resolved_bing,
         "syndication_attempted": len(synd_targets),
         "syndication_resolved": synd_ok,
-        "syndication_samples": [
-            {"from": k, "to": v[0], "to_domain": v[1]} for k, v in list(synd_map.items())[:5]
-        ],
+        "syndication_debug": synd_debug[:12],
         "all_outlets_hits": len(uniq_outlets),
         "all_outlets_domains": uniq_outlets,
         "trusted_hits": len(trusted_domains_found),
@@ -781,7 +823,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v7_3::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7_4::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -830,7 +872,7 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             "all_outlets_sample": sample_all,
             "syndication_attempted": br.get("syndication_attempted"),
             "syndication_resolved": br.get("syndication_resolved"),
-            "syndication_samples": br.get("syndication_samples", []),
+            "syndication_debug": br.get("syndication_debug", []),
         },
         "evidence_links": br.get("evidence_links", []) or [],
     }
@@ -1275,7 +1317,7 @@ def get_scan(scan_id: str):
 
 
 # -------------------------
-# Minimal share page (keeps your existing static/index UI)
+# Share page (shows corroboration evidence + debug)
 # -------------------------
 
 def _html_escape(s: str) -> str:
