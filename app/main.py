@@ -33,7 +33,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
 
 app = FastAPI(title="VeriScan V1 Demo (Hosted)")
-APP_VERSION = "veriscan-corroboration-v7_5-syndication-filterfix-2026-02-19"
+APP_VERSION = "veriscan-corroboration-v7_6-crossverify-weighted-2026-02-20"  # <-- bumped
 
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -77,6 +77,46 @@ TRUSTED_DOMAINS = {
     "fda.gov",
     "nih.gov",
 }
+
+# -------------------------
+# Cross-verify weighting (PATCH)
+# -------------------------
+# You can tune these without changing your response schema.
+MAJOR_OUTLETS = {
+    # Not all of these are in TRUSTED_DOMAINS; treat as "major" for partial credit
+    "ft.com",
+    "dw.com",
+    "france24.com",
+    "latimes.com",
+    "chicagotribune.com",
+    "theatlantic.com",
+    "newyorker.com",
+    "time.com",          # already trusted in your list; harmless
+    "pbs.org",           # already trusted
+}
+
+# "Syndication" and aggregators: should not earn outlet credit by themselves
+AGGREGATOR_DOMAINS = {
+    "msn.com",
+    "aol.com",
+    "yahoo.com",
+    "news.yahoo.com",
+    "news.google.com",
+    "google.com",
+    "bing.com",
+    "flipboard.com",
+    "smartnews.com",
+}
+
+# Weighted corroboration points:
+WEIGHT_TRUSTED = 1.00
+WEIGHT_MAJOR = 0.80
+WEIGHT_OTHER_NEWS = 0.45
+WEIGHT_UNKNOWN = 0.20
+
+# How many points counts as "strong" corroboration
+CROSS_VERIFY_STRONG_POINTS = 3.0
+CROSS_VERIFY_MAX_POINTS = 5.0  # scaling cap
 
 
 # -------------------------
@@ -759,6 +799,111 @@ async def _unmask_syndication(url: str, client: httpx.AsyncClient) -> tuple[str,
     return (best, pd, debug)
 
 
+# -------------------------
+# Weighted corroboration (PATCH)
+# -------------------------
+
+def _looks_like_news_domain(dom: str) -> bool:
+    """
+    Lightweight heuristic to give partial credit to legitimate newsroom domains
+    even if not in TRUSTED_DOMAINS.
+    """
+    d = normalize_domain(dom)
+    if not d:
+        return False
+    if d in TRUSTED_DOMAINS or d in MAJOR_OUTLETS:
+        return True
+    # common newsroom-ish keywords
+    for kw in ("news", "times", "post", "tribune", "journal", "press", "gazette", "herald"):
+        if kw in d:
+            return True
+    return False
+
+
+def _classify_outlet(dom: str) -> str:
+    d = normalize_domain(dom)
+    if not d:
+        return "unknown"
+    if d in AGGREGATOR_DOMAINS:
+        return "aggregator"
+    if _is_trusted_domain(d):
+        return "trusted"
+    if d in MAJOR_OUTLETS:
+        return "major"
+    if _looks_like_news_domain(d):
+        return "other_news"
+    return "unknown"
+
+
+def _compute_weighted_corroboration(domains: list[str], exclude_domain: str | None) -> dict:
+    """
+    Returns:
+      points, breakdown counts, unique_domains_used
+    Excludes aggregators and the scanned article domain.
+    """
+    exclude = normalize_domain(exclude_domain or "")
+
+    uniq = []
+    seen = set()
+    for d in domains or []:
+        dn = normalize_domain(d)
+        if not dn:
+            continue
+        if exclude and (dn == exclude or dn.endswith("." + exclude)):
+            continue
+        if dn in seen:
+            continue
+        seen.add(dn)
+        uniq.append(dn)
+
+    points = 0.0
+    breakdown = {"trusted": 0, "major": 0, "other_news": 0, "unknown": 0, "aggregator_ignored": 0}
+    used = []
+
+    for dn in uniq:
+        cls = _classify_outlet(dn)
+        if cls == "aggregator":
+            breakdown["aggregator_ignored"] += 1
+            continue
+
+        if cls == "trusted":
+            breakdown["trusted"] += 1
+            points += WEIGHT_TRUSTED
+        elif cls == "major":
+            breakdown["major"] += 1
+            points += WEIGHT_MAJOR
+        elif cls == "other_news":
+            breakdown["other_news"] += 1
+            points += WEIGHT_OTHER_NEWS
+        else:
+            breakdown["unknown"] += 1
+            points += WEIGHT_UNKNOWN
+
+        used.append(dn)
+
+    return {
+        "points": round(points, 2),
+        "breakdown": breakdown,
+        "unique_domains_used": used,
+        "unique_domains_total": len(uniq),
+    }
+
+
+def _cross_verify_score_from_points(points: float) -> int:
+    """
+    Map corroboration points -> 0..100 score.
+    - Caps at CROSS_VERIFY_MAX_POINTS.
+    - Guarantees a strong floor once you cross strong threshold.
+    """
+    if points <= 0:
+        return 0
+    capped = min(points, CROSS_VERIFY_MAX_POINTS)
+    score = int(round((capped / CROSS_VERIFY_MAX_POINTS) * 100))
+    if points >= CROSS_VERIFY_STRONG_POINTS:
+        score = max(score, 85)
+    return clamp(score)
+
+
 async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: str | None) -> dict:
     exclude = normalize_domain(exclude_domain or "")
     q = quote_plus(claim_query)
@@ -855,7 +1000,7 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
             e["domain"] = pub_dom
             e["url"] = pub_url
 
-    # Unique outlets
+    # Unique outlets (all, including non-trusted)
     all_domains = [e["domain"] for e in evidence]
     uniq_outlets = []
     seen = set()
@@ -881,6 +1026,9 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
     TOP_EVIDENCE = 10
     evidence_sorted = evidence_sorted[:TOP_EVIDENCE]
 
+    # Weighted corroboration points (PATCH)
+    weighted = _compute_weighted_corroboration(uniq_outlets, exclude_domain)
+
     return {
         "ok": True,
         "status_code": 200,
@@ -894,18 +1042,35 @@ async def bing_rss_corroboration_with_links(claim_query: str, exclude_domain: st
         "trusted_hits": len(trusted_domains_found),
         "trusted_domains": sorted(trusted_domains_found),
         "evidence_links": evidence_sorted,
+        # PATCH
+        "weighted_points": weighted["points"],
+        "weighted_breakdown": weighted["breakdown"],
+        "weighted_unique_used": weighted["unique_domains_used"],
+        "weighted_unique_total": weighted["unique_domains_total"],
     }
 
 
 async def trusted_corroboration(queries: list[str], exclude_domain: str | None) -> dict:
     queries = [q.strip() for q in (queries or []) if q and q.strip()]
     if not queries:
-        return {"hits": None, "domains": [], "queries_used": [], "engine": "none", "debug": {}, "evidence_links": []}
+        return {
+            "hits": None,
+            "domains": [],
+            "queries_used": [],
+            "engine": "none",
+            "debug": {},
+            "evidence_links": [],
+            # PATCH
+            "all_outlets_hits": 0,
+            "all_outlets_domains": [],
+            "weighted_points": 0.0,
+            "weighted_breakdown": {},
+        }
 
     claim_query = queries[0]
     exclude = normalize_domain(exclude_domain or "")
 
-    cache_key = f"corro_v7_5::{claim_query}||exclude={exclude}"
+    cache_key = f"corro_v7_6::{claim_query}||exclude={exclude}"
     cached = CORRO_CACHE.get(cache_key)
     if cached:
         fetched_at: datetime = cached.get("fetched_at")
@@ -917,6 +1082,11 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 "engine": cached.get("engine", "cache"),
                 "debug": cached.get("debug", {}),
                 "evidence_links": cached.get("evidence_links", []),
+                # PATCH
+                "all_outlets_hits": cached.get("all_outlets_hits", 0),
+                "all_outlets_domains": cached.get("all_outlets_domains", []),
+                "weighted_points": cached.get("weighted_points", 0.0),
+                "weighted_breakdown": cached.get("weighted_breakdown", {}),
             }
 
     br = await bing_rss_corroboration_with_links(claim_query, exclude_domain)
@@ -934,6 +1104,11 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
                 "note": "Bing RSS fetch failed; corroboration unavailable.",
             },
             "evidence_links": [],
+            # PATCH
+            "all_outlets_hits": 0,
+            "all_outlets_domains": [],
+            "weighted_points": 0.0,
+            "weighted_breakdown": {},
         }
         CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
         return result
@@ -955,9 +1130,27 @@ async def trusted_corroboration(queries: list[str], exclude_domain: str | None) 
             "syndication_attempted": br.get("syndication_attempted"),
             "syndication_resolved": br.get("syndication_resolved"),
             "syndication_debug": br.get("syndication_debug", []),
+            # PATCH (show why cross_verify improved)
+            "weighted_points": br.get("weighted_points", 0.0),
+            "weighted_breakdown": br.get("weighted_breakdown", {}),
+            "weighted_unique_used": br.get("weighted_unique_used", [])[:25],
+            "weighted_params": {
+                "trusted": WEIGHT_TRUSTED,
+                "major": WEIGHT_MAJOR,
+                "other_news": WEIGHT_OTHER_NEWS,
+                "unknown": WEIGHT_UNKNOWN,
+                "strong_points_target": CROSS_VERIFY_STRONG_POINTS,
+                "max_points_cap": CROSS_VERIFY_MAX_POINTS,
+            },
         },
         "evidence_links": br.get("evidence_links", []) or [],
+        # PATCH
+        "all_outlets_hits": br.get("all_outlets_hits", 0),
+        "all_outlets_domains": br.get("all_outlets_domains", []) or [],
+        "weighted_points": br.get("weighted_points", 0.0),
+        "weighted_breakdown": br.get("weighted_breakdown", {}),
     }
+
     CORRO_CACHE[cache_key] = {**result, "fetched_at": datetime.now(timezone.utc)}
     return result
 
@@ -997,6 +1190,11 @@ async def fetch_extract(url: str) -> dict:
                 "corroboration_engine": None,
                 "corroboration_debug": {"note": "Blocked by site (401/403)."},
                 "corroboration_evidence": [],
+                # PATCH
+                "corroboration_all_outlets_hits": None,
+                "corroboration_all_outlets_domains": [],
+                "corroboration_weighted_points": None,
+                "corroboration_weighted_breakdown": {},
             }
 
         r.raise_for_status()
@@ -1020,6 +1218,12 @@ async def fetch_extract(url: str) -> dict:
     queries = build_corroboration_queries(title, domain)
     corro = await trusted_corroboration(queries, exclude_domain=domain)
 
+    # PATCH: store extra corroboration signals for scoring & debug
+    weighted_points = corro.get("weighted_points", 0.0)
+    weighted_breakdown = corro.get("weighted_breakdown", {})
+    all_outlets_hits = corro.get("all_outlets_hits", 0)
+    all_outlets_domains = corro.get("all_outlets_domains", []) or []
+
     return {
         "final_url": final_url,
         "title": title,
@@ -1035,6 +1239,11 @@ async def fetch_extract(url: str) -> dict:
         "corroboration_engine": corro.get("engine"),
         "corroboration_debug": corro.get("debug", {}),
         "corroboration_evidence": corro.get("evidence_links", []),
+        # PATCH
+        "corroboration_all_outlets_hits": all_outlets_hits,
+        "corroboration_all_outlets_domains": all_outlets_domains[:25],
+        "corroboration_weighted_points": weighted_points,
+        "corroboration_weighted_breakdown": weighted_breakdown,
     }
 
 
@@ -1055,11 +1264,18 @@ def score_link(signals: dict) -> dict:
 
     source = clamp(int(0.45 * https_score + 0.30 * citations_score + 0.25 * domain_age_score))
 
+    # -------------------------
+    # CROSS VERIFY (PATCH)
+    # -------------------------
+    # Keep the old "trusted hits" behavior for display
     hits = signals.get("corroboration_hits")
-    if hits is None:
+
+    # New: use weighted corroboration points (trusted + major + other outlets)
+    weighted_points = signals.get("corroboration_weighted_points")
+    if weighted_points is None:
         cross_verify = 50
     else:
-        cross_verify = clamp(int(min(100, hits * 25)))
+        cross_verify = _cross_verify_score_from_points(float(weighted_points))
 
     ai_manip = 50
     context = 60 if signals.get("title") else 40
@@ -1070,34 +1286,45 @@ def score_link(signals: dict) -> dict:
     unavailable = ["AI_MANIPULATION"]
     if signals.get("domain_age_days") is None:
         unavailable.append("DOMAIN_AGE")
-    if signals.get("corroboration_hits") is None:
+    if signals.get("corroboration_weighted_points") is None:
         unavailable.append("CROSS_VERIFICATION")
 
     badges = []
     if signals.get("blocked"):
         badges.append("SITE_BLOCKED_AUTOMATION")
 
+    # Badge logic: prefer weighted corroboration but keep trusted-based badge too
     if isinstance(hits, int) and hits >= 3:
         badges.append("MULTI_SOURCE_CORROBORATION")
     elif isinstance(hits, int) and hits == 0:
         badges.append("NO_TRUSTED_CORROBORATION_FOUND")
 
+    # Optional extra badge based on weighted corroboration
+    try:
+        if isinstance(weighted_points, (int, float)) and float(weighted_points) >= CROSS_VERIFY_STRONG_POINTS:
+            badges.append("WIDELY_CORROBORATED_WEIGHTED")
+    except Exception:
+        pass
+
+    # Summary: show both trusted corroboration and total corroboration for clarity
+    all_hits = signals.get("corroboration_all_outlets_hits")
     if signals.get("blocked"):
         summary = (
             "This site blocked automated access. Domain and basic signals were still analyzed, "
             "but article content could not be fetched."
         )
     else:
-        if hits is None:
+        strength = ("strong" if source >= 70 else "mixed" if source >= 50 else "weak")
+        if weighted_points is None:
             summary = (
-                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-                f"Trusted-source corroboration was unavailable for this scan."
+                f"Source signals are {strength}. "
+                f"Corroboration was unavailable for this scan."
             )
         else:
-            summary = (
-                f"Source signals are {('strong' if source >= 70 else 'mixed' if source >= 50 else 'weak')}. "
-                f"Trusted-source corroboration found: {hits} other trusted domain(s)."
-            )
+            # Keep your original phrasing, but add total outlets so the score feels justified
+            trusted_part = f"Trusted-source corroboration found: {hits} other trusted domain(s)." if isinstance(hits, int) else "Trusted-source corroboration unavailable."
+            total_part = f" Total outlets found: {all_hits}." if isinstance(all_hits, int) else ""
+            summary = f"Source signals are {strength}. {trusted_part}{total_part}"
 
     return {
         "overall_score": overall,
@@ -1196,6 +1423,7 @@ def build_explanation(report: dict) -> dict:
     concerns = []
     missing_items = []
 
+    # Existing trusted hits highlight
     hits = signals.get("corroboration_hits")
     if isinstance(hits, int):
         if hits >= 3:
@@ -1204,6 +1432,23 @@ def build_explanation(report: dict) -> dict:
             highlights.append(f"Some trusted corroboration exists ({hits} matched trusted domain(s)).")
         elif hits == 0:
             concerns.append("No matches were found on the trusted corroboration list (not proof of falsehood, but less support).")
+
+    # PATCH: weighted corroboration highlight
+    wp = signals.get("corroboration_weighted_points")
+    wb = signals.get("corroboration_weighted_breakdown") or {}
+    if isinstance(wp, (int, float)):
+        if float(wp) >= CROSS_VERIFY_STRONG_POINTS:
+            highlights.append("Multiple independent outlets appear to corroborate similar facts (weighted corroboration is strong).")
+        elif float(wp) >= 1.0:
+            highlights.append("Some cross-outlet corroboration appears in broader coverage (weighted corroboration is moderate).")
+        elif float(wp) == 0:
+            concerns.append("Cross-outlet corroboration appears limited in current search results (this can also happen with syndicated/aggregated results).")
+
+        # Optional: small breakdown line in debug-friendly way
+        if isinstance(wb, dict) and any(k in wb for k in ("trusted", "major", "other_news", "unknown")):
+            highlights.append(
+                f"Corroboration mix: trusted={wb.get('trusted',0)}, major={wb.get('major',0)}, other={wb.get('other_news',0)}."
+            )
 
     age_days = signals.get("domain_age_days")
     if isinstance(age_days, int) and age_days >= 3650:
@@ -1443,6 +1688,10 @@ async function load(){{
       <div style="margin-top:8px;">
         Trusted hits: <code>${{esc(String(sig.corroboration_hits ?? "unavailable"))}}</code>
         &nbsp; Trusted domains: <code>${{esc((sig.corroboration_domains || []).join(", ") || "—")}}</code>
+      </div>
+
+      <div class="muted" style="margin-top:10px;">
+        Weighted points: <code>${{esc(String(sig.corroboration_weighted_points ?? "—"))}}</code>
       </div>
 
       <div class="muted" style="margin-top:10px;">
